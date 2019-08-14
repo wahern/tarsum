@@ -476,7 +476,7 @@ main(int argc, char **argv)
 	const char *path = NULL;
 	struct archive *a;
 	struct archive_entry *entry;
-	int optc, r, error;
+	int optc, r;
 
 	setlocale(LC_ALL, "");
 	timefmt = nl_langinfo(D_T_FMT);
@@ -521,7 +521,7 @@ main(int argc, char **argv)
 		unsigned mdlen;
 		EVP_MD_CTX *ctx;
 		const void *buf;
-		size_t buflen, i;
+		size_t buflen;
 
 		if (archive_entry_hardlink(entry)) {
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
