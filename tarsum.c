@@ -2,10 +2,13 @@
 #include <errno.h> /* EILSEQ errno */
 #include <limits.h> /* LINE_MAX ULONG_MAX */
 #include <locale.h> /* LC_ALL setlocale(3) */
+#include <langinfo.h> /* D_T_FMT nl_langinfo(3) */
 #include <stdarg.h> /* va_list va_start va_end */
+#include <stdint.h> /* intmax_t */
 #include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
 #include <stdlib.h> /* exit(3) free(3) malloc(3) strtoul(3) */
 #include <string.h> /* memcpy(3) strerror(3) */
+#include <time.h> /* localtime(3) strftime(3) */
 
 #include <err.h> /* vwarnx(3) */
 
@@ -185,14 +188,68 @@ fromxdigit(unsigned char ch, int def)
 	return def;
 }
 
+struct fieldspec {
+	int fmt;
+	int sub;
+};
+
+static void
+printifield(const struct fieldspec *fs, intmax_t v, FILE *fp)
+{
+	switch (fs->fmt) {
+	case 'O':
+		fprintf(fp, "%jo", v);
+		break;
+	case 'U':
+		fprintf(fp, "%ju", (uintmax_t)v);
+		break;
+	case 'X':
+		fprintf(fp, "%jx", v);
+		break;
+	default:
+		fprintf(fp, "%jd", v);
+		break;
+	}
+}
+
+static void
+printsfield(const char *fmt, const struct fieldspec *fs, int field, const char *s, FILE *fp)
+{
+	if (fs->fmt && fs->fmt != 'S')
+		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", fmt, fs->fmt, field);
+	fputs(s, fp);
+}
+
+static void
+printtfield(const char *timefmt, const struct fieldspec *fs, time_t v, FILE *fp)
+{
+	if (fs->fmt == 'S') {
+		static char buf[MAX(BUFSIZ, LINE_MAX)];
+		size_t n = strftime(buf, sizeof buf, timefmt, localtime(&v));
+		if (n > 0 && n < sizeof buf) {
+			fputs(buf, fp);
+		} else {
+			panic("%s: unable to format timestamp (%jd)", timefmt, (intmax_t)v);
+		}
+	} else {
+		printifield(fs, v, fp);
+	}
+}
+
 #define TOKEN(a, b) (((unsigned char)(a) << 8) | ((unsigned char)(b) << 0))
 #define isescaped(t) (0xff & ((t) >> 8))
 
+/* printentry
+ *
+ * NOTE: escape sequences mirror POSIX shell printf(1), format sequences
+ * patterned after BSD stat(1).
+ */
 static void
-printentry(const char *_fmt, const char *path, const void *md, size_t mdlen, FILE *fp)
+printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char *path, const void *md, size_t mdlen, struct archive_entry *ent, FILE *fp)
 {
 	const unsigned char *fmt = (const unsigned char *)_fmt;
 	unsigned char escaped = 0;
+	struct fieldspec fs = { 0 };
 
 	while (*fmt) {
 		int tok = TOKEN(escaped, *fmt++);
@@ -203,6 +260,7 @@ printentry(const char *_fmt, const char *path, const void *md, size_t mdlen, FIL
 			continue;
 		case '%':
 			escaped = '%';
+			fs = (struct fieldspec){ 0 };
 			continue;
 		}
 
@@ -261,11 +319,72 @@ printentry(const char *_fmt, const char *path, const void *md, size_t mdlen, FIL
 		case TOKEN('%', '%'):
 			fputc('%', fp);
 			break;
-		case TOKEN('%', 's'):
-			fputs(path, fp);
+		case TOKEN('%', 'A'):
+			printsfield(_fmt, &fs, 'A', EVP_MD_name(algo), fp);
 			break;
-		case TOKEN('%', 'x'):
-			fputs(md2hex(md, mdlen), fp);
+		case TOKEN('%', 'C'):
+			printsfield(_fmt, &fs, 'C', md2hex(md, mdlen), fp);
+			break;
+		case TOKEN('%', 'D'):
+			fs.fmt = 'D';
+			continue;
+		case TOKEN('%', 'H'):
+			fs.sub = 'H';
+			continue;
+		case TOKEN('%', 'L'):
+			fs.sub = 'L';
+			continue;
+		case TOKEN('%', 'M'):
+			fs.sub = 'M';
+			continue;
+		case TOKEN('%', 'N'):
+			printsfield(_fmt, &fs, 'N', path, fp);
+			break;
+		case TOKEN('%', 'S'):
+			fs.fmt = 'S';
+			continue;
+		case TOKEN('%', 'O'):
+			fs.fmt = 'O';
+			continue;
+		case TOKEN('%', 'U'):
+			fs.fmt = 'U';
+			continue;
+		case TOKEN('%', 'X'):
+			fs.fmt = 'X';
+			continue;
+		case TOKEN('%', 'a'):
+			printtfield(timefmt, &fs, archive_entry_atime(ent), fp);
+			break;
+		case TOKEN('%', 'c'):
+			printtfield(timefmt, &fs, archive_entry_ctime(ent), fp);
+			break;
+		case TOKEN('%', 'g'):
+			if (fs.fmt == 'S') {
+				const char *grp = archive_entry_gname(ent);
+				if (grp) {
+					fputs(grp, fp);
+					break;
+				}
+				/* FALL THROUGH */
+			}
+			printifield(&fs, archive_entry_gid(ent), fp);
+			break;
+		case TOKEN('%', 'm'):
+			printtfield(timefmt, &fs, archive_entry_mtime(ent), fp);
+			break;
+		case TOKEN('%', 'u'):
+			if (fs.fmt == 'S') {
+				const char *usr = archive_entry_uname(ent);
+				if (usr) {
+					fputs(usr, fp);
+					break;
+				}
+				/* FALL THROUGH */
+			}
+			printifield(&fs, archive_entry_uid(ent), fp);
+			break;
+		case TOKEN('%', 'z'):
+			printifield(&fs, archive_entry_size(ent), fp);
 			break;
 		default:
 			if (isescaped(tok)) {
@@ -320,7 +439,7 @@ optdigest(const char *opt)
 	return md;
 }
 
-#define SHORTOPTS "a:f:h"
+#define SHORTOPTS "a:f:t:h"
 #define F_DEFAULT "%x  %s\\n"
 static void
 usage(FILE *fp)
@@ -329,14 +448,19 @@ usage(FILE *fp)
 		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
 		"  -a DIGEST  digest algorithm (default: \"sha256\")\n" \
 		"  -f FORMAT  format specification (default: \"%s\")\n" \
+		"  -t FORMAT  strftime format specification\n" \
 		"  -h         print this usage message\n" \
 		"\n" \
 		"FORMAT\n" \
 		"  \\NNN  octal escape sequence\n" \
 		"  \\xNN  hexadecimal escape sequence\n" \
 		"  \\n    LF/NL\n" \
-		"  %%s    file name (full path)\n" \
-		"  %%x    hexadecimal digest\n" \
+		"  %%A    digest name\n" \
+		"  %%C    file digest\n" \
+		"  %%N    file name (full path)\n" \
+		"  %%g    GID or group name\n" \
+		"  %%u    UID or user name\n" \
+		"  %%z    file size\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
 	getprogname(), F_DEFAULT);
@@ -347,12 +471,14 @@ main(int argc, char **argv)
 {
 	const EVP_MD *algo = EVP_sha256();
 	const char *fmt = F_DEFAULT;
+	const char *timefmt = "";
 	const char *path = NULL;
 	struct archive *a;
 	struct archive_entry *entry;
 	int optc, r, error;
 
 	setlocale(LC_ALL, "");
+	timefmt = nl_langinfo(D_T_FMT);
 	setvbuf(stdout, NULL, _IOFBF, MAX(BUFSIZ, LINE_MAX));
 	ERR_load_crypto_strings();
 	OpenSSL_add_all_digests();
@@ -364,6 +490,9 @@ main(int argc, char **argv)
 			break;
 		case 'f':
 			fmt = optarg;
+			break;
+		case 't':
+			timefmt = optarg;
 			break;
 		case 'h':
 			usage(stdout);
@@ -396,7 +525,8 @@ main(int argc, char **argv)
 		if (archive_entry_hardlink(entry)) {
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
 			if (ent) {
-				printentry(fmt, path, ent->md, ent->mdlen, stdout);
+				/* XXX: will entry have the fields or should we pass ent? */
+				printentry(algo, timefmt, fmt, path, ent->md, ent->mdlen, entry, stdout);
 			}
 			continue;
 		}
@@ -422,7 +552,7 @@ main(int argc, char **argv)
 			errx(1, "%s", openssl_error_string());
 		EVP_MD_CTX_free(ctx);
 
-		printentry(fmt, path, md, mdlen, stdout);
+		printentry(algo, timefmt, fmt, path, md, mdlen, entry, stdout);
 		entryadd(path, md, mdlen);
 	}
 	if (archive_errno(a) != ARCHIVE_OK)
