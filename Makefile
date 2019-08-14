@@ -36,3 +36,4 @@ tarsum: tarsum.c
 
 clean:
 	$(RM) -f tarsum
+	$(RM) -fr tarsum.dSYM
