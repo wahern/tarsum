@@ -7,7 +7,7 @@
 #include <stdint.h> /* intmax_t */
 #include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
 #include <stdlib.h> /* exit(3) free(3) malloc(3) strtoul(3) */
-#include <string.h> /* memcpy(3) strerror(3) */
+#include <string.h> /* memcpy(3) memset(3) strdup(3) strerror(3) */
 #include <time.h> /* localtime(3) strftime(3) */
 
 #include <err.h> /* vwarnx(3) */
@@ -84,6 +84,94 @@ md2hex(const void *_src, size_t len)
 	*dst.p = '\0';
 
 	return (char *)md;
+}
+
+#define TARSUM_F_DEFAULT "%C  %N\\n"
+/*
+ * glibc 2.27:  %a %b %e %H:%M:%S %Y
+ * macOS 10.14: %a %b %e %X %Y
+ * musl 1.1.22: %a %b %e %T %Y
+ * OpenBSD 6.5: %a %b %e %H:%M:%S %Y
+ *
+ * NOTE: %T is equivalent to %H:%M:%S. %X is the national representation of
+ * the time.
+ */
+#define TARSUM_T_DEFAULT "%a %b %e %H:%M:%S %Y"
+
+#define TARSUMOPTS_INIT(opts) *tarsumopts_staticinit((opts))
+
+struct tarsumopts {
+	const EVP_MD *mdtype; /* -a option flag */
+	const char *format;   /* -f option flag */
+	const char *timefmt;  /* -t option flag */
+};
+
+struct tarsum {
+	const EVP_MD *mdtype;
+	char *format;
+	char *timefmt;
+	struct archive *archive;
+};
+
+static struct tarsumopts *
+tarsumopts_staticinit(struct tarsumopts *opts)
+{
+	*opts = (struct tarsumopts){
+		.mdtype = EVP_sha256(),
+		.format = TARSUM_F_DEFAULT,
+		.timefmt = TARSUM_T_DEFAULT,
+	};
+	return opts;
+}
+
+static int
+tarsum_destroy(struct tarsum *ts)
+{
+	int error = 0, status;
+
+	free(ts->format);
+	free(ts->timefmt);
+
+	if (ARCHIVE_OK != (status = archive_read_free(ts->archive)))
+		error = status; /* XXX: translate? */
+
+	memset(ts, 0, sizeof *ts);
+
+	return error;
+}
+
+static int
+tarsum_init(struct tarsum *ts, const struct tarsumopts *tsopts)
+{
+	int error;
+
+	*ts = (struct tarsum){ 0 };
+	ts->mdtype = tsopts->mdtype;
+	if (!(ts->format = strdup(tsopts->format)))
+		goto syerr;
+	if (!(ts->timefmt = strdup(tsopts->timefmt)))
+		goto syerr;
+	if (!(ts->archive = archive_read_new()))
+		goto syerr;
+	archive_read_support_filter_all(ts->archive);
+	archive_read_support_format_all(ts->archive);
+
+	return 0;
+syerr:
+	error = errno;
+	tarsum_destroy(ts);
+	return error;
+}
+
+/*
+ * NOTE: as of libarchive 3.4.0 the status return codes are all negative
+ * except for ARCHIVE_EOF
+ */
+static const char *
+tarsum_strerror(int error)
+{
+	/* FIXME: figure out better way stringify libarchive error codes */
+	return strerror(error);
 }
 
 struct entry {
@@ -194,8 +282,9 @@ struct fieldspec {
 };
 
 static void
-printifield(const struct fieldspec *fs, intmax_t v, FILE *fp)
+printifield(const struct tarsum *ts, const struct fieldspec *fs, intmax_t v, FILE *fp)
 {
+	(void)ts;
 	switch (fs->fmt) {
 	case 'O':
 		fprintf(fp, "%jo", v);
@@ -213,26 +302,26 @@ printifield(const struct fieldspec *fs, intmax_t v, FILE *fp)
 }
 
 static void
-printsfield(const char *fmt, const struct fieldspec *fs, int field, const char *s, FILE *fp)
+printsfield(const struct tarsum *ts, const struct fieldspec *fs, int field, const char *s, FILE *fp)
 {
 	if (fs->fmt && fs->fmt != 'S')
-		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", fmt, fs->fmt, field);
+		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", ts->format, fs->fmt, field);
 	fputs(s, fp);
 }
 
 static void
-printtfield(const char *timefmt, const struct fieldspec *fs, time_t v, FILE *fp)
+printtfield(const struct tarsum *ts, const struct fieldspec *fs, time_t v, FILE *fp)
 {
 	if (fs->fmt == 'S') {
 		static char buf[MAX(BUFSIZ, LINE_MAX)];
-		size_t n = strftime(buf, sizeof buf, timefmt, localtime(&v));
+		size_t n = strftime(buf, sizeof buf, ts->timefmt, localtime(&v));
 		if (n > 0 && n < sizeof buf) {
 			fputs(buf, fp);
 		} else {
-			panic("%s: unable to format timestamp (%jd)", timefmt, (intmax_t)v);
+			panic("%s: unable to format timestamp (%jd)", ts->timefmt, (intmax_t)v);
 		}
 	} else {
-		printifield(fs, v, fp);
+		printifield(ts, fs, v, fp);
 	}
 }
 
@@ -245,9 +334,9 @@ printtfield(const char *timefmt, const struct fieldspec *fs, time_t v, FILE *fp)
  * patterned after BSD stat(1).
  */
 static void
-printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char *path, const void *md, size_t mdlen, struct archive_entry *ent, FILE *fp)
+printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, struct archive_entry *ent, FILE *fp)
 {
-	const unsigned char *fmt = (const unsigned char *)_fmt;
+	const unsigned char *fmt = (const unsigned char *)ts->format;
 	unsigned char escaped = 0;
 	struct fieldspec fs = { 0 };
 
@@ -289,7 +378,7 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 				fputc(tok, fp);
 			} else {
 				purge(fp);
-				panic("%s: empty escape sequence", _fmt);
+				panic("%s: empty escape sequence", ts->format);
 			}
 			break;
 		case TOKEN('\\', '\\'):
@@ -320,10 +409,10 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 			fputc('%', fp);
 			break;
 		case TOKEN('%', 'A'):
-			printsfield(_fmt, &fs, 'A', EVP_MD_name(algo), fp);
+			printsfield(ts, &fs, 'A', EVP_MD_name(ts->mdtype), fp);
 			break;
 		case TOKEN('%', 'C'):
-			printsfield(_fmt, &fs, 'C', md2hex(md, mdlen), fp);
+			printsfield(ts, &fs, 'C', md2hex(md, mdlen), fp);
 			break;
 		case TOKEN('%', 'D'):
 			fs.fmt = 'D';
@@ -338,7 +427,7 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 			fs.sub = 'M';
 			continue;
 		case TOKEN('%', 'N'):
-			printsfield(_fmt, &fs, 'N', path, fp);
+			printsfield(ts, &fs, 'N', path, fp);
 			break;
 		case TOKEN('%', 'S'):
 			fs.fmt = 'S';
@@ -353,10 +442,10 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 			fs.fmt = 'X';
 			continue;
 		case TOKEN('%', 'a'):
-			printtfield(timefmt, &fs, archive_entry_atime(ent), fp);
+			printtfield(ts, &fs, archive_entry_atime(ent), fp);
 			break;
 		case TOKEN('%', 'c'):
-			printtfield(timefmt, &fs, archive_entry_ctime(ent), fp);
+			printtfield(ts, &fs, archive_entry_ctime(ent), fp);
 			break;
 		case TOKEN('%', 'g'):
 			if (fs.fmt == 'S') {
@@ -367,10 +456,10 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 				}
 				/* FALL THROUGH */
 			}
-			printifield(&fs, archive_entry_gid(ent), fp);
+			printifield(ts, &fs, archive_entry_gid(ent), fp);
 			break;
 		case TOKEN('%', 'm'):
-			printtfield(timefmt, &fs, archive_entry_mtime(ent), fp);
+			printtfield(ts, &fs, archive_entry_mtime(ent), fp);
 			break;
 		case TOKEN('%', 'u'):
 			if (fs.fmt == 'S') {
@@ -381,15 +470,15 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 				}
 				/* FALL THROUGH */
 			}
-			printifield(&fs, archive_entry_uid(ent), fp);
+			printifield(ts, &fs, archive_entry_uid(ent), fp);
 			break;
 		case TOKEN('%', 'z'):
-			printifield(&fs, archive_entry_size(ent), fp);
+			printifield(ts, &fs, archive_entry_size(ent), fp);
 			break;
 		default:
 			if (isescaped(tok)) {
 				purge(fp);
-				panic("%s: unknown %s sequence (%c%c)", _fmt, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
+				panic("%s: unknown %s sequence (%c%c)", ts->format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
 			}
 			fputc(tok, fp);
 			break;
@@ -400,7 +489,7 @@ printentry(const EVP_MD *algo, const char *timefmt, const char *_fmt, const char
 
 	if (escaped) {
 		purge(fp);
-		panic("%s: empty %s sequence", _fmt, (escaped == '\\')? "escape" : "format");
+		panic("%s: empty %s sequence", ts->format, (escaped == '\\')? "escape" : "format");
 	}
 
 	fflush(fp);
@@ -440,7 +529,6 @@ optdigest(const char *opt)
 }
 
 #define SHORTOPTS "a:f:t:h"
-#define F_DEFAULT "%C  %N\\n"
 static void
 usage(const char *arg0, FILE *fp)
 {
@@ -466,22 +554,20 @@ usage(const char *arg0, FILE *fp)
 		"  %%z    file size\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
-	progname, F_DEFAULT);
+	progname, TARSUM_F_DEFAULT);
 }
 
 int
 main(int argc, char **argv)
 {
-	const EVP_MD *algo = EVP_sha256();
-	const char *fmt = F_DEFAULT;
-	const char *timefmt = "";
+	struct tarsumopts opts = TARSUMOPTS_INIT(&opts);
 	const char *path = NULL;
-	struct archive *a;
 	struct archive_entry *entry;
-	int optc, r;
+	struct tarsum ts = { 0 };
+	int optc, status, error;
 
 	setlocale(LC_ALL, "");
-	timefmt = nl_langinfo(D_T_FMT);
+	opts.timefmt = nl_langinfo(D_T_FMT);
 	setvbuf(stdout, NULL, _IOFBF, MAX(BUFSIZ, LINE_MAX));
 	ERR_load_crypto_strings();
 	OpenSSL_add_all_digests();
@@ -489,13 +575,13 @@ main(int argc, char **argv)
 	while (-1 != (optc = getopt(argc, argv, SHORTOPTS))) {
 		switch (optc) {
 		case 'a':
-			algo = optdigest(optarg);
+			opts.mdtype = optdigest(optarg);
 			break;
 		case 'f':
-			fmt = optarg;
+			opts.format = optarg;
 			break;
 		case 't':
-			timefmt = optarg;
+			opts.timefmt = optarg;
 			break;
 		case 'h':
 			usage(*argv, stdout);
@@ -511,13 +597,12 @@ main(int argc, char **argv)
 
 	path = (argc > 0)? *argv : "/dev/stdin";
 
-	a = archive_read_new();
-	archive_read_support_filter_all(a);
-	archive_read_support_format_all(a);
-	r = archive_read_open_filename(a, path, 10240); // Note 1
-	if (r != ARCHIVE_OK)
-		exit(1);
-	while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+	if ((error = tarsum_init(&ts, &opts)))
+		panic("unable to initialize context: %s", strerror(error));
+
+	if (ARCHIVE_OK != (status = archive_read_open_filename(ts.archive, path, 10240)))
+		panic("%s: %s", path, archive_error_string(ts.archive));
+	while (archive_read_next_header(ts.archive, &entry) == ARCHIVE_OK) {
 		const char *path = archive_entry_pathname(entry);
 		unsigned char md[EVP_MAX_MD_SIZE];
 		unsigned mdlen;
@@ -529,40 +614,39 @@ main(int argc, char **argv)
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
 			if (ent) {
 				/* XXX: will entry have the fields or should we pass ent? */
-				printentry(algo, timefmt, fmt, path, ent->md, ent->mdlen, entry, stdout);
+				printentry(&ts, path, ent->md, ent->mdlen, entry, stdout);
 			}
 			continue;
 		}
 
-		if (!(ctx = EVP_MD_CTX_new()) || !EVP_DigestInit_ex(ctx, algo, NULL))
+		if (!(ctx = EVP_MD_CTX_new()) || !EVP_DigestInit_ex(ctx, ts.mdtype, NULL))
 			errx(1, "%s", openssl_error_string());
 
-		while (ARCHIVE_OK == (r = archive_read_data_block(a, &buf, &buflen, &(off_t){ 0 }))) {
+		while (ARCHIVE_OK == (status = archive_read_data_block(ts.archive, &buf, &buflen, &(off_t){ 0 }))) {
 			if (!EVP_DigestUpdate(ctx, buf, buflen))
 				errx(1, "%s", openssl_error_string());
 		}
-		switch (r) {
+		switch (status) {
 		case ARCHIVE_EOF:
 			break;
 		case ARCHIVE_WARN:
-			warnx("%s: %s", path, archive_error_string(a));
+			warnx("%s: %s", path, archive_error_string(ts.archive));
 			break;
 		default:
-			errx(1, "%s: %s", path, archive_error_string(a));
+			errx(1, "%s: %s", path, archive_error_string(ts.archive));
 		}
 
 		if (!EVP_DigestFinal_ex(ctx, md, &mdlen))
 			errx(1, "%s", openssl_error_string());
 		EVP_MD_CTX_free(ctx);
 
-		printentry(algo, timefmt, fmt, path, md, mdlen, entry, stdout);
+		printentry(&ts, path, md, mdlen, entry, stdout);
 		entryadd(path, md, mdlen);
 	}
-	if (archive_errno(a) != ARCHIVE_OK)
-		err(1, "%s", archive_error_string(a));
-	r = archive_read_free(a);  // Note 3
-	if (r != ARCHIVE_OK)
-		exit(1);
+	if (archive_errno(ts.archive) != ARCHIVE_OK)
+		panic("%s: %s", path, archive_error_string(ts.archive));
+	if ((error = tarsum_destroy(&ts)))
+		panic("%s: %s", path, tarsum_strerror(error));
 
 	return 0;
 }
