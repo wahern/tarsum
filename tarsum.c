@@ -111,6 +111,12 @@ struct tarsum {
 	char *format;
 	char *timefmt;
 	struct archive *archive;
+
+	struct {
+		int64_t soh; /* start of heading */
+		int64_t stx; /* start of text */
+		int64_t etx; /* end of text */
+	} cursor;
 };
 
 static struct tarsumopts *
@@ -461,6 +467,22 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 		case TOKEN('%', 'm'):
 			printtfield(ts, &fs, archive_entry_mtime(ent), fp);
 			break;
+		case TOKEN('%', 'o'):
+			switch (fs.sub) {
+			case '\0':
+				printifield(ts, &fs, ts->cursor.stx, fp);
+				break;
+			case 'H':
+				printifield(ts, &fs, ts->cursor.soh, fp);
+				break;
+			case 'L':
+				printifield(ts, &fs, ts->cursor.etx, fp);
+				break;
+			default:
+				purge(fp);
+				panic("%s: unsupported format sequence (%%%co)", ts->format, fs.sub);
+			}
+			break;
 		case TOKEN('%', 'u'):
 			if (fs.fmt == 'S') {
 				const char *usr = archive_entry_uname(ent);
@@ -473,7 +495,21 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 			printifield(ts, &fs, archive_entry_uid(ent), fp);
 			break;
 		case TOKEN('%', 'z'):
-			printifield(ts, &fs, archive_entry_size(ent), fp);
+			switch (fs.sub) {
+			case '\0':
+				printifield(ts, &fs, archive_entry_size(ent), fp);
+				break;
+			case 'H':
+				printifield(ts, &fs, ts->cursor.stx - ts->cursor.soh, fp);
+				break;
+			case 'L':
+				printifield(ts, &fs, ts->cursor.etx - ts->cursor.soh, fp);
+				break;
+			default:
+				purge(fp);
+				panic("%s: unsupported format sequence (%%%co)", ts->format, fs.sub);
+			}
+			break;
 			break;
 		default:
 			if (isescaped(tok)) {
@@ -550,6 +586,7 @@ usage(const char *arg0, FILE *fp)
 		"  %%N    file name (full path)\n" \
 		"  %%g    GID or group name\n" \
 		"  %%m    last modification time\n" \
+		"  %%o    file offset\n" \
 		"  %%u    UID or user name\n" \
 		"  %%z    file size\n" \
 		"\n" \
@@ -610,7 +647,13 @@ main(int argc, char **argv)
 		const void *buf;
 		size_t buflen;
 
+		ts.cursor.soh = archive_read_header_position(ts.archive);
+		ts.cursor.stx = archive_filter_bytes(ts.archive, 0);
+		ts.cursor.etx = ts.cursor.stx;
+
 		if (archive_entry_hardlink(entry)) {
+			/* XXX: should we do archive_read_data_skip? */
+
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
 			if (ent) {
 				/* XXX: will entry have the fields or should we pass ent? */
@@ -639,6 +682,8 @@ main(int argc, char **argv)
 		if (!EVP_DigestFinal_ex(ctx, md, &mdlen))
 			errx(1, "%s", openssl_error_string());
 		EVP_MD_CTX_free(ctx);
+
+		ts.cursor.etx = archive_filter_bytes(ts.archive, 0);
 
 		printentry(&ts, path, md, mdlen, entry, stdout);
 		entryadd(path, md, mdlen);
