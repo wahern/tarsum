@@ -1,11 +1,13 @@
-#include <errno.h>
-#include <limits.h>
-#include <locale.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <ctype.h> /* isdigit(3) */
+#include <errno.h> /* EILSEQ errno */
+#include <limits.h> /* LINE_MAX ULONG_MAX */
+#include <locale.h> /* LC_ALL setlocale(3) */
+#include <stdarg.h> /* va_list va_start va_end */
+#include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
+#include <stdlib.h> /* exit(3) free(3) malloc(3) strtoul(3) */
+#include <string.h> /* memcpy(3) strerror(3) */
 
-#include <err.h>
+#include <err.h> /* vwarnx(3) */
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -14,8 +16,22 @@
 
 #include "llrb.h"
 
+#ifndef HAVE___FPURGE
+#define HAVE___FPURGE (__linux || __sun)
+#endif
+
+#ifndef HAVE_FPURGE
+#define HAVE_FPURGE 1
+#endif
+
+#ifndef HAVE_STDIO_EXT_H
+#define HAVE_STDIO_EXT_H HAVE___FPURGE
+#endif
+
 #undef MIN
 #define MIN(a, b) (((a) < (b))? (a) : (b))
+#undef MAX
+#define MAX(a, b) (((a) > (b))? (a) : (b))
 
 #if !HAVE_EVP_MD_CTX_NEW
 #define EVP_MD_CTX_new(md) EVP_MD_CTX_create()
@@ -112,8 +128,35 @@ entryget(const char *path)
 	return LLRB_FIND(entries, &entries, &key);
 }
 
-static long
-optunsigned(const char *opt, int *error)
+__attribute__((noreturn))
+static void
+panic(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vwarnx(fmt, ap);
+	va_end(ap);
+	exit(EXIT_FAILURE);
+}
+
+#if HAVE_STDIO_EXT_H
+#include <stdio_ext.h>
+#endif
+
+static void
+purge(FILE *fp)
+{
+#if HAVE___FPURGE
+	__fpurge(fp);
+#elif HAVE_FPURGE
+	fpurge(fp);
+#else
+	(void)0;
+#endif
+}
+
+static int
+parseulong(unsigned long *_lu, const char *opt)
 {
 	char *end;
 	unsigned long lu;
@@ -121,44 +164,218 @@ optunsigned(const char *opt, int *error)
 	errno = 0;
 	lu = strtoul(opt, &end, 0);
 	if (lu == ULONG_MAX && errno != 0)
-		return (*error = errno), -1;
+		return errno;
 	if (*opt == '\0' || *end != '\0')
-		return (*error = EILSEQ), -1;
-	if (lu > LONG_MAX)
-		return (*error = ERANGE), -1;
+		return EILSEQ;
 
-	return lu;
+	*_lu = lu;
+	return 0;
+}
+
+static int
+fromxdigit(unsigned char ch, int def)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	/* XXX: A-F and a-f aren't guaranteed contiguous */
+	if (ch >= 'a' && ch <= 'f')
+		return 10 + (ch - 'a');
+	if (ch >= 'A' && ch <= 'F')
+		return 10 + (ch - 'A');
+	return def;
+}
+
+#define TOKEN(a, b) (((unsigned char)(a) << 8) | ((unsigned char)(b) << 0))
+#define isescaped(t) (0xff & ((t) >> 8))
+
+static void
+printentry(const char *_fmt, const char *path, const void *md, size_t mdlen, FILE *fp)
+{
+	const unsigned char *fmt = (const unsigned char *)_fmt;
+	unsigned char escaped = 0;
+
+	while (*fmt) {
+		int tok = TOKEN(escaped, *fmt++);
+
+		switch (tok) {
+		case '\\':
+			escaped = '\\';
+			continue;
+		case '%':
+			escaped = '%';
+			continue;
+		}
+
+		switch (tok) {
+		case TOKEN('\\', '0'): /* FALL THROUGH */
+		case TOKEN('\\', '1'): /* FALL THROUGH */
+		case TOKEN('\\', '2'): /* FALL THROUGH */
+		case TOKEN('\\', '3'): /* FALL THROUGH */
+		case TOKEN('\\', '4'): /* FALL THROUGH */
+		case TOKEN('\\', '5'): /* FALL THROUGH */
+		case TOKEN('\\', '6'): /* FALL THROUGH */
+		case TOKEN('\\', '7'):
+			tok = (tok & 0xff) - '0';
+			for (int n = 1; n < 3 && *fmt >= '0' && *fmt <= '7'; n++) {
+				tok <<= 3;
+				tok |= *fmt++ - '0';
+			}
+			fputc(tok, fp);
+			break;
+		case TOKEN('\\', 'x'):
+			if (EOF != (tok = fromxdigit(*fmt, EOF))) {
+				if (EOF != fromxdigit(*++fmt, EOF)) {
+					tok <<= 4;
+					tok |= fromxdigit(*fmt++, 0);
+				}
+				fputc(tok, fp);
+			} else {
+				purge(fp);
+				panic("%s: empty escape sequence", _fmt);
+			}
+			break;
+		case TOKEN('\\', '\\'):
+			fputc('\\', fp);
+			break;
+		case TOKEN('\\', 'a'):
+			fputc('\a', fp);
+			break;
+		case TOKEN('\\', 'b'):
+			fputc('\b', fp);
+			break;
+		case TOKEN('\\', 'f'):
+			fputc('\f', fp);
+			break;
+		case TOKEN('\\', 'n'):
+			fputc('\n', fp);
+			break;
+		case TOKEN('\\', 'r'):
+			fputc('\r', fp);
+			break;
+		case TOKEN('\\', 't'):
+			fputc('\t', fp);
+			break;
+		case TOKEN('\\', 'v'):
+			fputc('\v', fp);
+			break;
+		case TOKEN('%', '%'):
+			fputc('%', fp);
+			break;
+		case TOKEN('%', 's'):
+			fputs(path, fp);
+			break;
+		case TOKEN('%', 'x'):
+			fputs(md2hex(md, mdlen), fp);
+			break;
+		default:
+			if (isescaped(tok)) {
+				purge(fp);
+				panic("%s: unknown %s sequence (%c%c)", _fmt, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
+			}
+			fputc(tok, fp);
+			break;
+		}
+
+		escaped = 0;
+	}
+
+	if (escaped) {
+		purge(fp);
+		panic("%s: empty %s sequence", _fmt, (escaped == '\\')? "escape" : "format");
+	}
+
+	fflush(fp);
+}
+
+static const EVP_MD *
+optdigest(const char *opt)
+{
+	const EVP_MD *md = NULL;
+
+	if (isdigit((unsigned char)*opt)) {
+		unsigned long bits;
+		int error;
+
+		if ((error = parseulong(&bits, opt)))
+			panic("%s: %s", opt, strerror(error));
+
+		switch (bits) {
+		case 256:
+			md = EVP_sha256();
+			break;
+		case 384:
+			md = EVP_sha384();
+			break;
+		case 512:
+			md = EVP_sha512();
+			break;
+		}
+	} else {
+		md = EVP_get_digestbyname(opt);
+	}
+
+	if (md == NULL)
+		panic("%s: unknown digest algorithn", opt);
+
+	return md;
+}
+
+#define SHORTOPTS "a:f:h"
+#define F_DEFAULT "%x  %s\\n"
+static void
+usage(FILE *fp)
+{
+	fprintf(fp,
+		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
+		"  -a DIGEST  digest algorithm (default: \"sha256\")\n" \
+		"  -f FORMAT  format specification (default: \"%s\")\n" \
+		"  -h         print this usage message\n" \
+		"\n" \
+		"FORMAT\n" \
+		"  \\NNN  octal escape sequence\n" \
+		"  \\xNN  hexadecimal escape sequence\n" \
+		"  \\n    LF/NL\n" \
+		"  %%s    file name (full path)\n" \
+		"  %%x    hexadecimal digest\n" \
+		"\n" \
+		"Report bugs to <william@25thandClement.com>\n",
+	getprogname(), F_DEFAULT);
 }
 
 int
 main(int argc, char **argv)
 {
 	const EVP_MD *algo = EVP_sha256();
+	const char *fmt = F_DEFAULT;
 	const char *path = NULL;
 	struct archive *a;
 	struct archive_entry *entry;
 	int optc, r, error;
 
 	setlocale(LC_ALL, "");
+	setvbuf(stdout, NULL, _IOFBF, MAX(BUFSIZ, LINE_MAX));
 	ERR_load_crypto_strings();
 	OpenSSL_add_all_digests();
 
-	while (-1 != (optc = getopt(argc, argv, "a:"))) {
+	while (-1 != (optc = getopt(argc, argv, SHORTOPTS))) {
 		switch (optc) {
 		case 'a':
-			switch (optunsigned(optarg, &error)) {
-			default:
-				errx(1, "%s: unknown algorithm", optarg);
-			}
+			algo = optdigest(optarg);
 			break;
+		case 'f':
+			fmt = optarg;
+			break;
+		case 'h':
+			usage(stdout);
+			return 0;
+		default:
+			usage(stderr);
+			return EXIT_FAILURE;
 		}
 	}
 
 	argc -= optind;
 	argv += optind;
-
-	if (argc == 0)
-		errx(1, "no tar file specified");
 
 	path = (argc > 0)? *argv : "/dev/stdin";
 
@@ -179,7 +396,7 @@ main(int argc, char **argv)
 		if (archive_entry_hardlink(entry)) {
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
 			if (ent) {
-				printf("%s  %s\n", md2hex(ent->md, ent->mdlen), path);
+				printentry(fmt, path, ent->md, ent->mdlen, stdout);
 			}
 			continue;
 		}
@@ -205,7 +422,7 @@ main(int argc, char **argv)
 			errx(1, "%s", openssl_error_string());
 		EVP_MD_CTX_free(ctx);
 
-		printf("%s  %s\n", md2hex(md, mdlen), path);
+		printentry(fmt, path, md, mdlen, stdout);
 		entryadd(path, md, mdlen);
 	}
 	if (archive_errno(a) != ARCHIVE_OK)
