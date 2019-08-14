@@ -442,8 +442,10 @@ optdigest(const char *opt)
 #define SHORTOPTS "a:f:t:h"
 #define F_DEFAULT "%x  %s\\n"
 static void
-usage(FILE *fp)
+usage(const char *arg0, FILE *fp)
 {
+	const char *progname = strrchr(arg0, '/')? strrchr(arg0, '/') + 1 : arg0;
+
 	fprintf(fp,
 		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
 		"  -a DIGEST   digest algorithm (default: \"sha256\")\n" \
@@ -464,7 +466,7 @@ usage(FILE *fp)
 		"  %%z    file size\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
-	getprogname(), F_DEFAULT);
+	progname, F_DEFAULT);
 }
 
 int
@@ -496,10 +498,10 @@ main(int argc, char **argv)
 			timefmt = optarg;
 			break;
 		case 'h':
-			usage(stdout);
+			usage(*argv, stdout);
 			return 0;
 		default:
-			usage(stderr);
+			usage(*argv, stderr);
 			return EXIT_FAILURE;
 		}
 	}
