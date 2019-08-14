@@ -440,7 +440,7 @@ optdigest(const char *opt)
 }
 
 #define SHORTOPTS "a:f:t:h"
-#define F_DEFAULT "%x  %s\\n"
+#define F_DEFAULT "%C  %N\\n"
 static void
 usage(const char *arg0, FILE *fp)
 {
