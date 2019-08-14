@@ -446,12 +446,12 @@ usage(FILE *fp)
 {
 	fprintf(fp,
 		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
-		"  -a DIGEST  digest algorithm (default: \"sha256\")\n" \
-		"  -f FORMAT  format specification (default: \"%s\")\n" \
-		"  -t FORMAT  strftime format specification\n" \
-		"  -h         print this usage message\n" \
+		"  -a DIGEST   digest algorithm (default: \"sha256\")\n" \
+		"  -f FORMAT   format specification (default: \"%s\")\n" \
+		"  -t TIMEFMT  strftime format specification\n" \
+		"  -h          print this usage message\n" \
 		"\n" \
-		"FORMAT\n" \
+		"FORMAT (see printf(1) and BSD stat(1))\n" \
 		"  \\NNN  octal escape sequence\n" \
 		"  \\xNN  hexadecimal escape sequence\n" \
 		"  \\n    LF/NL\n" \
@@ -459,6 +459,7 @@ usage(FILE *fp)
 		"  %%C    file digest\n" \
 		"  %%N    file name (full path)\n" \
 		"  %%g    GID or group name\n" \
+		"  %%m    last modification time\n" \
 		"  %%u    UID or user name\n" \
 		"  %%z    file size\n" \
 		"\n" \
