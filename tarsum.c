@@ -31,6 +31,10 @@
 #define HAVE_STDIO_EXT_H HAVE___FPURGE
 #endif
 
+#ifndef HAVE_STRLCPY
+#define HAVE_STRLCPY (!__GLIBC__)
+#endif
+
 #undef MIN
 #define MIN(a, b) (((a) < (b))? (a) : (b))
 #undef MAX
@@ -84,6 +88,22 @@ md2hex(const void *_src, size_t len)
 	*dst.p = '\0';
 
 	return (char *)md;
+}
+
+static size_t
+tarsum_strlcpy(char *dst, const char *src, size_t lim)
+{
+#if HAVE_STRLCPY
+	return strlcpy(dst, src, lim);
+#else
+	size_t len = strlen(src);
+	if (lim) {
+		size_t n = MIN(lim - 1, len);
+		memcpy(dst, src, n);
+		dst[n] = '\0';
+	}
+	return len;
+#endif
 }
 
 #define TARSUM_F_DEFAULT "%C  %N\\n"
@@ -208,7 +228,7 @@ entryadd(const char *path, const void *md, size_t mdlen)
 	SHA256(ent->name, sizeof ent->name, path, strlen(path));
 	memcpy(ent->md, md, MIN(mdlen, sizeof ent->md));
 	ent->mdlen = mdlen;
-	strlcpy(ent->path, path, sizeof ent->path);
+	tarsum_strlcpy(ent->path, path, sizeof ent->path);
 	if ((oent = LLRB_INSERT(entries, &entries, ent))) {
 		warnx("duplicate (%s) (%s)", path, ent->path);
 		warnx("  %s", md2hex(ent->name, sizeof ent->name));
