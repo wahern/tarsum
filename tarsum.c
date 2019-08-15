@@ -32,7 +32,7 @@
 #include <stdarg.h> /* va_list va_start va_end */
 #include <stdint.h> /* intmax_t */
 #include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
-#include <stdlib.h> /* exit(3) free(3) malloc(3) strtoul(3) */
+#include <stdlib.h> /* abort(3) exit(3) free(3) malloc(3) strtoul(3) */
 #include <string.h> /* memcpy(3) memset(3) strdup(3) strerror(3) strlen(3) */
 #include <time.h> /* localtime(3) strftime(3) */
 
@@ -132,6 +132,20 @@ addsize_overflow(size_t *r, size_t a, size_t b)
 		return ERANGE;
 	*r = a + b;
 	return 0;
+}
+
+static int
+errno_assert(int error)
+{
+	if (error)
+		return error;
+#if __GNUC__
+	__builtin_trap();
+	__builtin_unreachable();
+#else
+	abort();
+	return EFAULT;
+#endif
 }
 
 #define SBUF_INTO(_base, _size) { \
@@ -437,11 +451,10 @@ subexpr_exec(struct tarsum_subexpr *subexpr, char **dst, const char *src, struct
 
 	if ((error = regexec(&subexpr->regex, src, subexpr->nmatch, subexpr->match, 0))) {
 		if (error == REG_NOMATCH) {
-			*dst = (char *)src;
 			return 0;
 		} else {
 			regerror_fill(regerr, error, &subexpr->regex, src);
-			return error;
+			return TARSUM_EREGEXEC;
 		}
 	}
 again:
@@ -470,20 +483,20 @@ again:
 	sbuf_put(&buf, &src[subexpr->match[0].rm_eo], strlen(src) - subexpr->match[0].rm_eo);
 	sbuf_putc(&buf, '\0');
 
-	if (buf.p <= buf.size) {
-		*dst = subexpr->replbuf.base;
-		if (strchr(subexpr->flags, 'p')) {
-			warnx("%s >> %s", src, (**dst == '\0')? "<empty string>" : *dst);
-		}
-		return 0;
+	if (!(buf.p <= buf.size)) {
+		char *tmpbuf = realloc(subexpr->replbuf.base, buf.p);
+		if (!tmpbuf)
+			return errno_assert(errno);
+		subexpr->replbuf.base = tmpbuf;
+		subexpr->replbuf.size = buf.p;
+		goto again;
 	}
 
-	char *tmpbuf = realloc(subexpr->replbuf.base, buf.p);
-	if (!tmpbuf)
-		return errno;
-	subexpr->replbuf.base = tmpbuf;
-	subexpr->replbuf.size = buf.p;
-	goto again;
+	*dst = subexpr->replbuf.base;
+	if (strchr(subexpr->flags, 'p')) {
+		warnx("%s >> %s", src, (**dst == '\0')? "<empty string>" : *dst);
+	}
+	return 0;
 }
 
 static void
@@ -504,6 +517,8 @@ subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *
 
 	for (const char *flag = flags; *flag; flag++) {
 		switch (*flag) {
+		case '|': /* chain subexprs */
+			break;
 		case 'e':
 			cflags |= REG_EXTENDED;
 			break;
@@ -513,7 +528,7 @@ subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *
 		case 'm':
 			cflags |= REG_NEWLINE;
 			break;
-		case 'p':
+		case 'p': /* print diagnostic on replacement */
 			break;
 		default:
 			/* FIXME: need to communicate flag character to caller */
@@ -535,7 +550,7 @@ subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *
 		return ENOMEM;
 
 	if (!(subexpr = calloc(1, size)))
-		return errno;
+		return errno_assert(errno);
 
 	struct sbuf sbuf = { .base = (void *)subexpr, .size = size, };
 	sbuf_ffwd(&sbuf, offsetof(struct tarsum_subexpr, match));
@@ -617,7 +632,7 @@ tarsum_addsubexpr(struct tarsum *ts, const char *_subexpr)
 	if (!_subexpr)
 		return EINVAL;
 	if (!(subexpr = strdup(_subexpr)))
-		return errno;
+		return errno_assert(errno);
 	if (!(error = subexpr_split(&patexpr, &replexpr, &flags, subexpr))) {
 		struct tarsum_subexpr *subexpr;
 		if (!(error = subexpr_init(&subexpr, patexpr, replexpr, flags, &ts->regerr))) {
@@ -731,7 +746,7 @@ parseulong(unsigned long *_lu, const char *opt)
 	errno = 0;
 	lu = strtoul(opt, &end, 0);
 	if (lu == ULONG_MAX && errno != 0)
-		return errno;
+		return errno_assert(errno);
 	if (*opt == '\0' || *end != '\0')
 		return EILSEQ;
 
@@ -1154,14 +1169,17 @@ main(int argc, char **argv)
 
 		struct tarsum_subexpr *subexpr;
 		TAILQ_FOREACH(subexpr, &ts.subexprs, tqe) {
-			char *_path = NULL;
-			if ((error = subexpr_exec(subexpr, &_path, path, &ts.regerr))) {
+			char *repl = NULL;
+			if ((error = subexpr_exec(subexpr, &repl, path, &ts.regerr))) {
 				if (error == TARSUM_EREGEXEC) {
 					warnx("%s", ts.regerr.descr);
 				}
 				panic("unable to apply substitution expression: %s", tarsum_strerror(error));
+			} else if (repl) {
+				path = repl;
+				if (!strchr(subexpr->flags, '|'))
+					break;
 			}
-			path = _path;
 		}
 
 		ts.cursor.soh = archive_read_header_position(ts.archive);
