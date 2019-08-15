@@ -681,7 +681,7 @@ entrycmp(const struct entry *a, const struct entry *b)
 	return memcmp(a->name, b->name, sizeof a->name);
 }
 
-LLRB_GENERATE_STATIC(entries, entry, rbe, entrycmp);
+LLRB_GENERATE_STATIC(entries, entry, rbe, entrycmp)
 
 static void
 entryadd(const char *path, const void *md, size_t mdlen)
