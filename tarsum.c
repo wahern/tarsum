@@ -524,7 +524,7 @@ subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *
 
 	size = offsetof(struct tarsum_subexpr, match);
 	size += strlen(patexpr) + 1;
-		size += strlen(replexpr) + 1;
+	size += strlen(replexpr) + 1;
 	size += strlen(flags) + 1;
 
 	/* +1 for 0th match */
