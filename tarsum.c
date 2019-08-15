@@ -611,13 +611,13 @@ optdigest(const char *opt)
 
 #define SHORTOPTS "a:f:t:h"
 static void
-usage(const char *arg0, FILE *fp)
+usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 {
 	const char *progname = strrchr(arg0, '/')? strrchr(arg0, '/') + 1 : arg0;
 
 	fprintf(fp,
 		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
-		"  -a DIGEST   digest algorithm (default: \"sha256\")\n" \
+		"  -a DIGEST   digest algorithm (default: \"%s\")\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
 		"  -t TIMEFMT  strftime format specification\n" \
 		"  -h          print this usage message\n" \
@@ -625,18 +625,19 @@ usage(const char *arg0, FILE *fp)
 		"FORMAT (see printf(1) and BSD stat(1))\n" \
 		"  \\NNN  octal escape sequence\n" \
 		"  \\xNN  hexadecimal escape sequence\n" \
-		"  \\n    LF/NL\n" \
+		"  \\L    C escape sequence (\\\\, \\a, \\b, \\f, \\n, \\r, \\t, \\v)\n" \
+		"  %%%%    percent literal\n" \
 		"  %%A    digest name\n" \
 		"  %%C    file digest\n" \
 		"  %%N    file name (full path)\n" \
-		"  %%g    GID or group name\n" \
-		"  %%m    last modification time\n" \
-		"  %%o    file offset\n" \
-		"  %%u    UID or user name\n" \
-		"  %%z    file size\n" \
+		"  %%g    GID or group name (%%Sg)\n" \
+		"  %%m    last modification time (%%Sm: strftime formatting)\n" \
+		"  %%o    file offset (%%Ho: header record, %%Lo: end of last file record)\n" \
+		"  %%u    UID or user name (%%Su)\n" \
+		"  %%z    file size (%%Hz: header record(s), %%Lz: header and file records)\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
-	progname, TARSUM_F_DEFAULT);
+	progname, EVP_MD_name(opts->mdtype), opts->timefmt);
 }
 
 int
@@ -666,10 +667,10 @@ main(int argc, char **argv)
 			opts.timefmt = optarg;
 			break;
 		case 'h':
-			usage(*argv, stdout);
+			usage(*argv, &opts, stdout);
 			return 0;
 		default:
-			usage(*argv, stderr);
+			usage(*argv, &opts, stderr);
 			return EXIT_FAILURE;
 		}
 	}
