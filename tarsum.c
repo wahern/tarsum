@@ -56,7 +56,7 @@
 
 #ifndef HAVE_REALLOCARRAY
 #ifdef __GLIBC_PREREQ
-#define HAVE_REALLOCARRAY (__GLIBC_PREREQ(2, 26))
+#define HAVE_REALLOCARRAY (__GLIBC_PREREQ(2, 26) && _GNU_SOURCE)
 #else
 #define HAVE_REALLOCARRAY (!__linux && !__APPLE__)
 #endif
