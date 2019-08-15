@@ -24,18 +24,20 @@
  * ==========================================================================
  */
 #include <ctype.h> /* isdigit(3) */
-#include <errno.h> /* EILSEQ errno */
+#include <errno.h> /* EILSEQ ENOBUFS ENOMEM ERANGE errno */
 #include <limits.h> /* LINE_MAX ULONG_MAX */
 #include <locale.h> /* LC_ALL setlocale(3) */
 #include <langinfo.h> /* D_T_FMT nl_langinfo(3) */
+#include <regex.h> /* regex_t regcomp(3) regerror(3) regexec(3) regfree(3) */
 #include <stdarg.h> /* va_list va_start va_end */
 #include <stdint.h> /* intmax_t */
 #include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
 #include <stdlib.h> /* exit(3) free(3) malloc(3) strtoul(3) */
-#include <string.h> /* memcpy(3) memset(3) strdup(3) strerror(3) */
+#include <string.h> /* memcpy(3) memset(3) strdup(3) strerror(3) strlen(3) */
 #include <time.h> /* localtime(3) strftime(3) */
 
 #include <err.h> /* vwarnx(3) */
+#include <sys/queue.h> /* TAILQ_* */
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -50,6 +52,14 @@
 
 #ifndef HAVE_FPURGE
 #define HAVE_FPURGE 1
+#endif
+
+#ifndef HAVE_REALLOCARRAY
+#ifdef __GLIBC_PREREQ
+#define HAVE_REALLOCARRAY (__GLIBC_PREREQ(2, 26))
+#else
+#define HAVE_REALLOCARRAY (!__GLIBC__ && !__APPLE__)
+#endif
 #endif
 
 #ifndef HAVE_STDIO_EXT_H
@@ -115,6 +125,113 @@ md2hex(const void *_src, size_t len)
 	return (char *)md;
 }
 
+static int
+addsize_overflow(size_t *r, size_t a, size_t b)
+{
+	if (~a < b)
+		return ERANGE;
+	*r = a + b;
+	return 0;
+}
+
+#define SBUF_INTO(_base, _size) { \
+	.base = (unsigned char *)(_base), \
+	.size = (_size), \
+}
+
+struct sbuf {
+	unsigned char *base;
+	size_t size, p;
+};
+
+static struct sbuf *
+sbuf_init(struct sbuf *sbuf, void *base, size_t size)
+{
+	sbuf->base = base;
+	sbuf->size = size;
+	sbuf->p = 0;
+	return sbuf;
+}
+
+static size_t
+sbuf_clamp(struct sbuf *sbuf, size_t n)
+{
+	return (sbuf->p < sbuf->size)? MIN(n, sbuf->size - sbuf->p) : 0;
+}
+
+static int
+sbuf_error(struct sbuf *sbuf)
+{
+	return (sbuf->p <= sbuf->size)? 0 : ENOBUFS;
+}
+
+static void *
+sbuf_getptr(struct sbuf *sbuf)
+{
+	return &sbuf->base[MIN(sbuf->p, sbuf->size)];
+}
+
+static int
+sbuf_ffwd(struct sbuf *sbuf, size_t n)
+{
+	sbuf->p = (~sbuf->p < n)? SIZE_MAX : sbuf->p + n;
+	return sbuf_error(sbuf);
+}
+
+static int
+sbuf_putc(struct sbuf *sbuf, unsigned char ch)
+{
+	if (sbuf->p < sbuf->size) {
+		sbuf->base[sbuf->p++] = ch;
+		return 0;
+	} else if (sbuf->p < SIZE_MAX) {
+		sbuf->p++;
+		return ENOBUFS;
+	} else {
+		return ENOBUFS;
+	}
+}
+
+static int
+sbuf_put(struct sbuf *sbuf, const void *src, size_t len)
+{
+	size_t n = sbuf_clamp(sbuf, len);
+	if (n) {
+		memcpy(&sbuf->base[sbuf->p], src, n);
+		sbuf->p += n;
+		len -= n;
+	}
+
+	return sbuf_ffwd(sbuf, len);
+}
+
+static int
+sbuf_puts(struct sbuf *sbuf, const void *src)
+{
+	return sbuf_put(sbuf, src, strlen(src));
+}
+
+static int
+sbuf_puts0(struct sbuf *sbuf, const void *src)
+{
+	sbuf_puts(sbuf, src);
+	return sbuf_putc(sbuf, '\0');
+}
+
+static void *
+tarsum_reallocarray(void *arr, size_t nmemb, size_t size)
+{
+#if HAVE_REALLOCARRAY
+	return reallocarray(arr, nmemb, size);
+#else
+	if (nmemb > 0 && SIZE_MAX / nmemb < size) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return realloc(arr, nmemb * size);
+#endif
+}
+
 static size_t
 tarsum_strlcpy(char *dst, const char *src, size_t lim)
 {
@@ -130,6 +247,16 @@ tarsum_strlcpy(char *dst, const char *src, size_t lim)
 	return len;
 #endif
 }
+
+#define TARSUM_EBASE -(('T' << 24) | ('A' << 16) | ('R' << 8) | 'S')
+
+enum tarsum_errors {
+	TARSUM_EREGCOMP = TARSUM_EBASE,
+	TARSUM_EREGEXEC,
+	TARSUM_EBADNSUB,
+	TARSUM_EBADFLAG,
+	TARSUM_ELAST,
+};
 
 #define TARSUM_F_DEFAULT "%C  %N\\n"
 /*
@@ -151,10 +278,20 @@ struct tarsumopts {
 	const char *timefmt;  /* -t option flag */
 };
 
+struct tarsum_subexpr {
+	char *patexpr, *replexpr, *flags;
+	regex_t regex;
+	TAILQ_ENTRY(tarsum_subexpr) tqe;
+	struct { char *base; size_t size; } replbuf;
+	size_t nmatch;
+	regmatch_t match[];
+};
+
 struct tarsum {
 	const EVP_MD *mdtype;
 	char *format;
 	char *timefmt;
+	TAILQ_HEAD(, tarsum_subexpr) subexprs;
 	struct archive *archive;
 
 	struct {
@@ -162,6 +299,11 @@ struct tarsum {
 		int64_t stx; /* start of text */
 		int64_t etx; /* end of text */
 	} cursor;
+
+	struct regerror {
+		char descr[256];
+		int error;
+	} regerr;
 };
 
 static struct tarsumopts *
@@ -175,6 +317,8 @@ tarsumopts_staticinit(struct tarsumopts *opts)
 	return opts;
 }
 
+static void subexpr_free(struct tarsum_subexpr *);
+
 static int
 tarsum_destroy(struct tarsum *ts)
 {
@@ -185,6 +329,12 @@ tarsum_destroy(struct tarsum *ts)
 
 	if (ARCHIVE_OK != (status = archive_read_free(ts->archive)))
 		error = status; /* XXX: translate? */
+
+	while (!TAILQ_EMPTY(&ts->subexprs)) {
+		struct tarsum_subexpr *subexpr = TAILQ_FIRST(&ts->subexprs);
+		TAILQ_REMOVE(&ts->subexprs, subexpr, tqe);
+		subexpr_free(subexpr);
+	}
 
 	memset(ts, 0, sizeof *ts);
 
@@ -197,6 +347,8 @@ tarsum_init(struct tarsum *ts, const struct tarsumopts *tsopts)
 	int error;
 
 	*ts = (struct tarsum){ 0 };
+	TAILQ_INIT(&ts->subexprs);
+
 	ts->mdtype = tsopts->mdtype;
 	if (!(ts->format = strdup(tsopts->format)))
 		goto syerr;
@@ -215,14 +367,287 @@ syerr:
 }
 
 /*
+ * NOTE: substring match counter from my Lua Unix (lunix) regcomp code
+ */
+#define NSUB_ESCAPE 0x100
+#define NSUB_BRACKET 0x200
+#define NSUB_ESCAPED(ch) ((ch) | NSUB_ESCAPE)
+#define NSUB_BRACKETED(ch) ((ch) | NSUB_BRACKET)
+
+static size_t
+regcomp_nsub(const char *cp, const int cflags)
+{
+	const char *obp = NULL;
+	int state = 0, ch;
+	size_t n = 0;
+
+	for (; (ch = (*cp)? (state | *cp) : 0); cp++) {
+		state &= ~NSUB_ESCAPE;
+
+		switch (ch) {
+		case '\\':
+			state |= NSUB_ESCAPE;
+			break;
+		case '[':
+			obp = cp;
+			state |= NSUB_BRACKET;
+			break;
+		case NSUB_BRACKETED(']'):
+			if (cp == &obp[1])
+				break;
+			if (cp == &obp[2] && obp[1] == '^')
+				break;
+			obp = NULL;
+			state &= ~NSUB_BRACKET;
+			break;
+		case '(':
+			n += !!(cflags & REG_EXTENDED);
+			break;
+		case NSUB_ESCAPED('('):
+			n += !(cflags & REG_EXTENDED);
+			break;
+		default:
+			break;
+		}
+	}
+
+	return n;
+}
+
+static void
+regerror_fill(struct regerror *regerr, int error, const regex_t *regex, const char *what)
+{
+	regerr->error = error;
+	if (what) {
+		struct sbuf buf = SBUF_INTO(regerr->descr, sizeof regerr->descr);
+		sbuf_puts(&buf, what);
+		sbuf_puts(&buf, ": ");
+		size_t n = regerror(error, regex, sbuf_getptr(&buf), sbuf_clamp(&buf, SIZE_MAX));
+		if (0 == sbuf_ffwd(&buf, n + 1))
+			return;
+	}
+	regerror(error, regex, regerr->descr, sizeof regerr->descr);
+}
+
+static int
+subexpr_exec(struct tarsum_subexpr *subexpr, char **dst, const char *src, struct regerror *regerr)
+{
+	struct sbuf buf;
+	int error;
+
+	if ((error = regexec(&subexpr->regex, src, subexpr->nmatch, subexpr->match, 0))) {
+		if (error == REG_NOMATCH) {
+			*dst = (char *)src;
+			return 0;
+		} else {
+			regerror_fill(regerr, error, &subexpr->regex, src);
+			return error;
+		}
+	}
+again:
+	sbuf_init(&buf, subexpr->replbuf.base, subexpr->replbuf.size);
+	sbuf_put(&buf, src, subexpr->match[0].rm_so);
+
+	int escaped = 0;
+	for (const char *replexpr = subexpr->replexpr; *replexpr; replexpr++) {
+		if (escaped) {
+			if (!(*replexpr >= '0' && *replexpr <= '9')) {
+				sbuf_putc(&buf, *replexpr);
+			} else if ((size_t)(*replexpr - '0') < subexpr->nmatch) {
+				regmatch_t *rm = &subexpr->match[*replexpr - '0'];
+				sbuf_put(&buf, &src[rm->rm_so], rm->rm_eo - rm->rm_so);
+			}
+		} else if (*replexpr == '\\') {
+			escaped = 1;
+		} else if (*replexpr == '&') {
+			regmatch_t *rm = &subexpr->match[0];
+			sbuf_put(&buf, &src[rm->rm_so], rm->rm_eo - rm->rm_so);
+		} else {
+			sbuf_putc(&buf, *replexpr);
+		}
+	}
+
+	sbuf_put(&buf, &src[subexpr->match[0].rm_eo], strlen(src) - subexpr->match[0].rm_eo);
+	sbuf_putc(&buf, '\0');
+
+	if (buf.p <= buf.size) {
+		*dst = subexpr->replbuf.base;
+		if (strchr(subexpr->flags, 'p')) {
+			warnx("%s >> %s", src, (**dst == '\0')? "<empty string>" : *dst);
+		}
+		return 0;
+	}
+
+	char *tmpbuf = realloc(subexpr->replbuf.base, buf.p);
+	if (!tmpbuf)
+		return errno;
+	subexpr->replbuf.base = tmpbuf;
+	subexpr->replbuf.size = buf.p;
+	goto again;
+}
+
+static void
+subexpr_free(struct tarsum_subexpr *subexpr)
+{
+	regfree(&subexpr->regex);
+	free(subexpr->replbuf.base);
+	free(subexpr);
+}
+
+static int
+subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *replexpr, const char *flags, struct regerror *regerr)
+{
+	struct tarsum_subexpr *subexpr = NULL;
+	int cflags = 0;
+	size_t nmatch, size;
+	int error;
+
+	for (const char *flag = flags; *flag; flag++) {
+		switch (*flag) {
+		case 'e':
+			cflags |= REG_EXTENDED;
+			break;
+		case 'i':
+			cflags |= REG_ICASE;
+			break;
+		case 'm':
+			cflags |= REG_NEWLINE;
+			break;
+		case 'p':
+			break;
+		default:
+			/* FIXME: need to communicate flag character to caller */
+			warnx("%c: unsupported pattern flag", *flag);
+			return TARSUM_EBADFLAG;
+		}
+	}
+
+	size = offsetof(struct tarsum_subexpr, match);
+	size += strlen(patexpr) + 1;
+		size += strlen(replexpr) + 1;
+	size += strlen(flags) + 1;
+
+	/* +1 for 0th match */
+	nmatch = 1 + regcomp_nsub(patexpr, cflags);
+	if (SIZE_MAX / sizeof subexpr->match[0] < nmatch)
+		return ENOMEM;
+	if (addsize_overflow(&size, size, sizeof subexpr->match[0] * nmatch))
+		return ENOMEM;
+
+	if (!(subexpr = calloc(1, size)))
+		return errno;
+
+	struct sbuf sbuf = { .base = (void *)subexpr, .size = size, };
+	sbuf_ffwd(&sbuf, offsetof(struct tarsum_subexpr, match));
+	sbuf_ffwd(&sbuf, sizeof subexpr->match[0] * nmatch);
+	subexpr->patexpr = sbuf_getptr(&sbuf); sbuf_puts0(&sbuf, patexpr);
+	subexpr->replexpr = sbuf_getptr(&sbuf); sbuf_puts0(&sbuf, replexpr);
+	subexpr->flags = sbuf_getptr(&sbuf); sbuf_puts0(&sbuf, flags);
+	if ((error = sbuf_error(&sbuf))) {
+		free(subexpr);
+		return error;
+	}
+
+	subexpr->nmatch = nmatch;
+
+	if ((error = regcomp(&subexpr->regex, subexpr->patexpr, cflags))) {
+		regerror_fill(regerr, error, &subexpr->regex, patexpr);
+		free(subexpr);
+		return TARSUM_EREGCOMP;
+	}
+
+	/* shouldn't happen */
+	if (subexpr->regex.re_nsub >= subexpr->nmatch) {
+		regfree(&subexpr->regex);
+		free(subexpr);
+		return TARSUM_EBADNSUB;
+	}
+
+	*_subexpr = subexpr;
+
+	return 0;
+}
+
+static int
+subexpr_split(char **patexpr, char **replexpr, char **flags, char *cp)
+{
+	int delim, escaped;
+
+	delim = *cp++;
+	if (!delim || delim == '\\')
+		return EINVAL;
+
+	*patexpr = cp;
+	escaped = 0;
+	for (; *cp; cp++) {
+		if (escaped) {
+			escaped = 0;
+		} else if (*cp == '\\') {
+			escaped = 1;
+		} else if (*cp == delim) {
+			*cp++ = '\0';
+			break;
+		}
+	}
+
+	*replexpr = cp;
+	escaped = 0;
+	for (; *cp; cp++) {
+		if (escaped) {
+			escaped = 0;
+		} else if (*cp == '\\') {
+			escaped = 1;
+		} else if (*cp == delim) {
+			*cp++ = '\0';
+			break;
+		}
+	}
+
+	*flags = cp;
+
+	return 0;
+}
+
+static int
+tarsum_addsubexpr(struct tarsum *ts, const char *_subexpr)
+{
+	char *subexpr = NULL, *patexpr, *replexpr, *flags;
+	int error;
+
+	if (!_subexpr)
+		return EINVAL;
+	if (!(subexpr = strdup(_subexpr)))
+		return errno;
+	if (!(error = subexpr_split(&patexpr, &replexpr, &flags, subexpr))) {
+		struct tarsum_subexpr *subexpr;
+		if (!(error = subexpr_init(&subexpr, patexpr, replexpr, flags, &ts->regerr))) {
+			TAILQ_INSERT_TAIL(&ts->subexprs, subexpr, tqe);
+		}
+	}
+	free(subexpr);
+	return error;
+}
+
+/*
  * NOTE: as of libarchive 3.4.0 the status return codes are all negative
  * except for ARCHIVE_EOF
  */
 static const char *
 tarsum_strerror(int error)
 {
-	/* FIXME: figure out better way stringify libarchive error codes */
-	return strerror(error);
+	switch (error) {
+	case TARSUM_EREGCOMP:
+		return "regcomp failure";
+	case TARSUM_EREGEXEC:
+		return "regexec failure";
+	case TARSUM_EBADNSUB:
+		return "miscalculated number of substring matches";
+	case TARSUM_EBADFLAG:
+		return "unsupported pattern flag";
+	default:
+		/* FIXME: figure out better way stringify libarchive error codes */
+		return strerror(error);
+	}
 }
 
 struct entry {
@@ -609,7 +1034,26 @@ optdigest(const char *opt)
 	return md;
 }
 
-#define SHORTOPTS "a:f:t:h"
+static void
+optsfree(const char ***opts, size_t *optc)
+{
+	free(*opts);
+	*opts = NULL;
+	*optc = 0;
+}
+
+static const char **
+optspush(const char ***opts, size_t *optc, const char *opt)
+{
+	const char **p = tarsum_reallocarray(*opts, *optc + 2, sizeof *p);
+	if (!p)
+		panic("%s", strerror(errno));
+	p[(*optc)++] = opt;
+	p[*optc] = NULL;
+	return *opts = p;
+}
+
+#define SHORTOPTS "a:f:s:t:h"
 static void
 usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 {
@@ -619,6 +1063,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
 		"  -a DIGEST   digest algorithm (default: \"%s\")\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
+		"  -s SUBEXPR  path substitution expression\n" \
 		"  -t TIMEFMT  strftime format specification\n" \
 		"  -h          print this usage message\n" \
 		"\n" \
@@ -644,6 +1089,8 @@ int
 main(int argc, char **argv)
 {
 	struct tarsumopts opts = TARSUMOPTS_INIT(&opts);
+	const char **subexprs = NULL;
+	size_t nsubexpr = 0;
 	const char *path = NULL;
 	struct archive_entry *entry;
 	struct tarsum ts = { 0 };
@@ -663,6 +1110,9 @@ main(int argc, char **argv)
 		case 'f':
 			opts.format = optarg;
 			break;
+		case 's':
+			optspush(&subexprs, &nsubexpr, optarg);
+			break;
 		case 't':
 			opts.timefmt = optarg;
 			break;
@@ -680,8 +1130,17 @@ main(int argc, char **argv)
 
 	path = (argc > 0)? *argv : "/dev/stdin";
 
-	if ((error = tarsum_init(&ts, &opts)))
-		panic("unable to initialize context: %s", strerror(error));
+	error = tarsum_init(&ts, &opts);
+	for (const char **subexpr = subexprs; !error && subexpr && *subexpr; subexpr++) {
+		error = tarsum_addsubexpr(&ts, *subexpr);
+		if (error == TARSUM_EREGCOMP) {
+			warnx("%s", ts.regerr.descr);
+			warnx("%s: bad substitution expression", *subexpr);
+		}
+	}
+	optsfree(&subexprs, &nsubexpr);
+	if (error)
+		panic("unable to initialize context: %s", tarsum_strerror(error));
 
 	if (ARCHIVE_OK != (status = archive_read_open_filename(ts.archive, path, 10240)))
 		panic("%s: %s", path, archive_error_string(ts.archive));
@@ -692,6 +1151,18 @@ main(int argc, char **argv)
 		EVP_MD_CTX *ctx;
 		const void *buf;
 		size_t buflen;
+
+		struct tarsum_subexpr *subexpr;
+		TAILQ_FOREACH(subexpr, &ts.subexprs, tqe) {
+			char *_path;
+			if ((error = subexpr_exec(subexpr, &_path, path, &ts.regerr))) {
+				if (error == TARSUM_EREGEXEC) {
+					warnx("%s", ts.regerr.descr);
+				}
+				panic("unable to apply substitution expression: %s", tarsum_strerror(error));
+			}
+			path = _path;
+		}
 
 		ts.cursor.soh = archive_read_header_position(ts.archive);
 		ts.cursor.stx = archive_filter_bytes(ts.archive, 0);
