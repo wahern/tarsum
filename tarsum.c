@@ -58,7 +58,7 @@
 #ifdef __GLIBC_PREREQ
 #define HAVE_REALLOCARRAY (__GLIBC_PREREQ(2, 26))
 #else
-#define HAVE_REALLOCARRAY (!__GLIBC__ && !__APPLE__)
+#define HAVE_REALLOCARRAY (!__linux && !__APPLE__)
 #endif
 #endif
 
@@ -1154,7 +1154,7 @@ main(int argc, char **argv)
 
 		struct tarsum_subexpr *subexpr;
 		TAILQ_FOREACH(subexpr, &ts.subexprs, tqe) {
-			char *_path;
+			char *_path = NULL;
 			if ((error = subexpr_exec(subexpr, &_path, path, &ts.regerr))) {
 				if (error == TARSUM_EREGEXEC) {
 					warnx("%s", ts.regerr.descr);
