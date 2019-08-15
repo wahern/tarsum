@@ -1182,6 +1182,9 @@ main(int argc, char **argv)
 			}
 		}
 
+		if (!*path)
+			continue;
+
 		ts.cursor.soh = archive_read_header_position(ts.archive);
 		ts.cursor.stx = archive_filter_bytes(ts.archive, 0);
 		ts.cursor.etx = ts.cursor.stx;
