@@ -75,6 +75,14 @@
 #undef MAX
 #define MAX(a, b) (((a) > (b))? (a) : (b))
 
+#if WITH_DEBUG
+#define DEBUG(...) warnx(__VA_ARGS__)
+#define DEBUG_DO(...) __VA_ARGS__
+#else
+#define DEBUG(...) (void)0
+#define DEBUG_DO(...) (void)0
+#endif
+
 #if !HAVE_EVP_MD_CTX_NEW
 #define EVP_MD_CTX_new(md) EVP_MD_CTX_create()
 #endif
@@ -444,58 +452,115 @@ regerror_fill(struct regerror *regerr, int error, const regex_t *regex, const ch
 }
 
 static int
-subexpr_exec(struct tarsum_subexpr *subexpr, char **dst, const char *src, struct regerror *regerr)
+subexpr_setbuf(struct tarsum_subexpr *subexpr, size_t size)
 {
-	struct sbuf buf;
-	int error;
+	char *buf = realloc(subexpr->replbuf.base, size);
+	if (!buf)
+		return errno_assert(errno);
+	subexpr->replbuf.base = buf;
+	subexpr->replbuf.size = size;
+	return 0;
+}
 
-	if ((error = regexec(&subexpr->regex, src, subexpr->nmatch, subexpr->match, 0))) {
-		if (error == REG_NOMATCH) {
-			return 0;
-		} else {
+static int
+subexpr_exec(struct tarsum_subexpr *subexpr, char **dst, const char *_src, struct regerror *regerr)
+{
+	const regmatch_t *const rm = subexpr->match;
+	const char *src;
+	struct sbuf buf;
+	size_t reps;
+	int eflags, error;
+
+	DEBUG_DO(subexpr_setbuf(subexpr, 1000));
+restart:
+	src = _src;
+	sbuf_init(&buf, subexpr->replbuf.base, subexpr->replbuf.size);
+	reps = 0;
+	eflags = 0;
+again:
+	DEBUG("REGEX -> %s", src);
+	if ((error = regexec(&subexpr->regex, src, subexpr->nmatch, subexpr->match, eflags))) {
+		DEBUG("NO MATCH");
+		if (error != REG_NOMATCH) {
 			regerror_fill(regerr, error, &subexpr->regex, src);
 			return TARSUM_EREGEXEC;
-		}
-	}
-again:
-	sbuf_init(&buf, subexpr->replbuf.base, subexpr->replbuf.size);
-	sbuf_put(&buf, src, subexpr->match[0].rm_so);
-
-	int escaped = 0;
-	for (const char *replexpr = subexpr->replexpr; *replexpr; replexpr++) {
-		if (escaped) {
-			if (!(*replexpr >= '0' && *replexpr <= '9')) {
-				sbuf_putc(&buf, *replexpr);
-			} else if ((size_t)(*replexpr - '0') < subexpr->nmatch) {
-				regmatch_t *rm = &subexpr->match[*replexpr - '0'];
-				sbuf_put(&buf, &src[rm->rm_so], rm->rm_eo - rm->rm_so);
-			}
-		} else if (*replexpr == '\\') {
-			escaped = 1;
-		} else if (*replexpr == '&') {
-			regmatch_t *rm = &subexpr->match[0];
-			sbuf_put(&buf, &src[rm->rm_so], rm->rm_eo - rm->rm_so);
+		} else if (reps > 0) {
+			goto suffix;
 		} else {
-			sbuf_putc(&buf, *replexpr);
+			return 0;
+		}
+	}
+	DEBUG("MATCH -> %.*s(%.*s)%.*s", (int)rm[0].rm_so, src, (int)(rm[0].rm_eo - rm[0].rm_so), &src[rm[0].rm_so], (int)(strlen(src) - rm[0].rm_eo), &src[rm[0].rm_eo]);
+
+	/* copy unmatched prefix */
+	sbuf_put(&buf, src, rm[0].rm_so);
+
+	int escaped = 0, rc;
+	for (const char *replexpr = subexpr->replexpr; (rc = *replexpr); replexpr++) {
+		if (escaped) {
+			if (!(rc >= '0' && rc <= '9')) {
+				sbuf_putc(&buf, rc);
+			} else if ((size_t)(rc - '0') < subexpr->nmatch) {
+				size_t i = rc - '0';
+				sbuf_put(&buf, &src[rm[i].rm_so], rm[i].rm_eo - rm[i].rm_so);
+			}
+		} else if (rc == '\\') {
+			escaped = 1;
+		} else if (rc == '&') {
+			sbuf_put(&buf, &src[rm[0].rm_so], rm[0].rm_eo - rm[0].rm_so);
+		} else {
+			sbuf_putc(&buf, rc);
 		}
 	}
 
-	sbuf_put(&buf, &src[subexpr->match[0].rm_eo], strlen(src) - subexpr->match[0].rm_eo);
-	sbuf_putc(&buf, '\0');
+	/* retire prefix and match */
+	src += rm[0].rm_eo;
+
+	/*
+	 * try again if g flag specified
+	 *
+	 * NOTE: Zero-width matches (e.g. [[:<:]] and [[:>:]], but also ^
+	 * and $ in some circumstances) could cause us to loop infinitely.
+	 * Examples:
+	 *
+	 *   /[[:<:]]/x/g
+	 *   /$/x/g
+	 *   /^.|$/x/ge
+	 *
+	 * We can't properly support them without using REG_STARTEND. Even
+	 * if we bumped src on zero-width matches, the matching semantics
+	 * can't work without REG_STARTEND providing lookbehind capability.
+	 *
+	 * Some ERE constructs also don't seem to work correctly without
+	 * REG_STARTEND, such as /^|$/x/ge, which [on macOS, at least] only
+	 * matches once even without our zero-width match short-circuit.
+	 * Perhaps the implementation itself has a loop mitigation hack that
+	 * disables $ matches on REG_NOTBOL? For this reason we don't bother
+	 * using a smarter test that could permit some EREs currently
+	 * aborted prematurely.
+	 *
+	 * TODO: Use REG_STARTEND where available.
+	 */
+	if (strchr(subexpr->flags, 'g') && (rm[0].rm_eo - rm[0].rm_so) > 0) {
+		reps++;
+		eflags |= REG_NOTBOL;
+		goto again;
+	}
+suffix:
+	/* copy unmatched suffix */
+	sbuf_puts0(&buf, src);
 
 	if (!(buf.p <= buf.size)) {
-		char *tmpbuf = realloc(subexpr->replbuf.base, buf.p);
-		if (!tmpbuf)
-			return errno_assert(errno);
-		subexpr->replbuf.base = tmpbuf;
-		subexpr->replbuf.size = buf.p;
-		goto again;
+		if ((error = subexpr_setbuf(subexpr, buf.p)))
+			return error;
+		goto restart;
 	}
 
 	*dst = subexpr->replbuf.base;
 	if (strchr(subexpr->flags, 'p')) {
-		warnx("%s >> %s", src, (**dst == '\0')? "<empty string>" : *dst);
+		warnx("%s >> %s", _src, (**dst == '\0')? "<empty string>" : *dst);
 	}
+
 	return 0;
 }
 
@@ -521,6 +586,8 @@ subexpr_init(struct tarsum_subexpr **_subexpr, const char *patexpr, const char *
 			break;
 		case 'e':
 			cflags |= REG_EXTENDED;
+			break;
+		case 'g': /* global replacement */
 			break;
 		case 'i':
 			cflags |= REG_ICASE;
