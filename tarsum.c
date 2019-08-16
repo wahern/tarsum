@@ -1,7 +1,7 @@
 /* ==========================================================================
  * tarsum.c - checksum utility for tar files
  * --------------------------------------------------------------------------
- * Copyright (c) 2019  William Ahern
+ * Copyright (c) 2017, 2019  William Ahern
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
