@@ -519,7 +519,8 @@ again:
 	src += rm[0].rm_eo;
 
 	/*
-	 * try again if g flag specified
+	 * try again if g flag specified, but short-circuit on zero-width
+	 * matches
 	 *
 	 * NOTE: Zero-width matches (e.g. [[:<:]] and [[:>:]], but also ^
 	 * and $ in some circumstances) could cause us to loop infinitely.
@@ -537,9 +538,10 @@ again:
 	 * REG_STARTEND, such as /^|$/x/ge, which [on macOS, at least] only
 	 * matches once even without our zero-width match short-circuit.
 	 * Perhaps the implementation itself has a loop mitigation hack that
-	 * disables $ matches on REG_NOTBOL? For this reason we don't bother
-	 * using a smarter test that could permit some EREs currently
-	 * aborted prematurely.
+	 * disables $ matches on REG_NOTBOL?
+	 *
+	 * For these reasons we don't bother using a smarter test that could
+	 * permit some EREs currently aborted prematurely.
 	 *
 	 * TODO: Use REG_STARTEND where available.
 	 */
