@@ -502,8 +502,10 @@ again:
 				sbuf_putc(&buf, rc);
 			} else if ((size_t)(rc - '0') < subexpr->nmatch) {
 				size_t i = rc - '0';
-				sbuf_put(&buf, &src[rm[i].rm_so], rm[i].rm_eo - rm[i].rm_so);
+				if (rm[i].rm_so >= 0)
+					sbuf_put(&buf, &src[rm[i].rm_so], rm[i].rm_eo - rm[i].rm_so);
 			}
+			escaped = 0;
 		} else if (rc == '\\') {
 			escaped = 1;
 		} else if (rc == '&') {
