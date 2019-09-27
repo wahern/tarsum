@@ -887,6 +887,77 @@ printtfield(const struct tarsum *ts, const struct fieldspec *fs, time_t v, FILE 
 	}
 }
 
+static void
+printTfield(const struct tarsum *ts, const struct fieldspec *fs, mode_t mode, FILE *fp)
+{
+	if (fs->fmt && fs->fmt != 'S')
+		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", ts->format, fs->fmt, 'T');
+
+	switch (fs->sub) {
+	case 'H':
+		switch (S_IFMT & mode) {
+		case S_IFIFO:
+			fputs("Fifo File", fp);
+			break;
+		case S_IFCHR:
+			fputs("Character Device", fp);
+			break;
+		case S_IFDIR:
+			fputs("Directory", fp);
+			break;
+		case S_IFBLK:
+			fputs("Block Device", fp);
+			break;
+		case S_IFREG:
+			fputs("Regular File", fp);
+			break;
+		case S_IFLNK:
+			fputs("Symbolic Link", fp);
+			break;
+		case S_IFSOCK:
+			fputs("Socket", fp);
+			break;
+		default:
+			fputs("Unknown", fp);
+			break;
+		}
+		break;
+	case '\0':
+		/* FALL THROUGH */
+	case 'L':
+		switch (S_IFMT & mode) {
+		case S_IFIFO:
+			fputc('|', fp);
+			break;
+		case S_IFCHR:
+			break;
+		case S_IFDIR:
+			fputc('/', fp);
+			break;
+		case S_IFBLK:
+			break;
+		case S_IFREG:
+			if (mode & (S_IXUSR|S_IXGRP|S_IXOTH)) {
+				fputc('*', fp);
+			}
+			break;
+		case S_IFLNK:
+			fputc('@', fp);
+			break;
+		case S_IFSOCK:
+			fputc('=', fp);
+			break;
+		default:
+			/* just ignore */
+			break;
+		}
+		break;
+	default:
+		purge(fp);
+		panic("%s: unsupported format sequence (%%%co)", ts->format, fs->sub);
+	}
+}
+
 #define TOKEN(a, b) (((unsigned char)(a) << 8) | ((unsigned char)(b) << 0))
 #define isescaped(t) (0xff & ((t) >> 8))
 
@@ -997,6 +1068,9 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 		case TOKEN('%', 'O'):
 			fs.fmt = 'O';
 			continue;
+		case TOKEN('%', 'T'):
+			printTfield(ts, &fs, archive_entry_mode(ent), fp);
+			break;
 		case TOKEN('%', 'U'):
 			fs.fmt = 'U';
 			continue;
@@ -1065,7 +1139,6 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 				purge(fp);
 				panic("%s: unsupported format sequence (%%%co)", ts->format, fs.sub);
 			}
-			break;
 			break;
 		default:
 			if (isescaped(tok)) {
@@ -1161,6 +1234,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  %%A    digest name\n" \
 		"  %%C    file digest\n" \
 		"  %%N    file name (full path)\n" \
+		"  %%T    file type (ls -L suffix character; use %%HT for long name)\n" \
 		"  %%g    GID or group name (%%Sg)\n" \
 		"  %%m    last modification time (%%Sm: strftime formatting)\n" \
 		"  %%o    file offset (%%Ho: header record, %%Lo: end of last file record)\n" \
