@@ -1150,7 +1150,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  -a DIGEST   digest algorithm (default: \"%s\")\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
 		"  -s SUBEXPR  path substitution expression\n" \
-		"  -t TIMEFMT  strftime format specification\n" \
+		"  -t TIMEFMT  strftime format specification (default: \"%s\")\n" \
 		"  -h          print this usage message\n" \
 		"\n" \
 		"FORMAT (see printf(1) and BSD stat(1))\n" \
@@ -1168,7 +1168,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  %%z    file size (%%Hz: header record(s), %%Lz: header and file records)\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
-	progname, EVP_MD_name(opts->mdtype), opts->timefmt);
+	progname, EVP_MD_name(opts->mdtype), opts->format, opts->timefmt);
 }
 
 int
