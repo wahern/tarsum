@@ -952,6 +952,38 @@ printTfield(const struct tarsum *ts, const struct fieldspec *fs, mode_t mode, FI
 			break;
 		}
 		break;
+	case 'M':
+		/*
+		 * print characters used for find(1) -type (M subfield
+		 * specifier for T specifier unused by BSD stat(1))
+		 */
+		switch (S_IFMT & mode) {
+		case S_IFIFO:
+			fputc('p', fp);
+			break;
+		case S_IFCHR:
+			fputc('c', fp);
+			break;
+		case S_IFDIR:
+			fputc('d', fp);
+			break;
+		case S_IFBLK:
+			fputc('b', fp);
+			break;
+		case S_IFREG:
+			fputc('f', fp);
+			break;
+		case S_IFLNK:
+			fputc('l', fp);
+			break;
+		case S_IFSOCK:
+			fputc('s', fp);
+			break;
+		default:
+			/* just ignore */
+			break;
+		}
+		break;
 	default:
 		purge(fp);
 		panic("%s: unsupported format sequence (%%%co)", ts->format, fs->sub);
@@ -1234,7 +1266,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  %%A    digest name\n" \
 		"  %%C    file digest\n" \
 		"  %%N    file name (full path)\n" \
-		"  %%T    file type (ls -L suffix character; use %%HT for long name)\n" \
+		"  %%T    file type (ls -L suffix character; use %%HT for long name, %%MT for single letter)\n" \
 		"  %%g    GID or group name (%%Sg)\n" \
 		"  %%m    last modification time (%%Sm: strftime formatting)\n" \
 		"  %%o    file offset (%%Ho: header record, %%Lo: end of last file record)\n" \
