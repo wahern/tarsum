@@ -1,7 +1,7 @@
 /* ==========================================================================
  * tarsum.c - checksum utility for tar files
  * --------------------------------------------------------------------------
- * Copyright (c) 2017, 2019  William Ahern
+ * Copyright (c) 2017, 2019, 2022  William Ahern
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
@@ -23,6 +23,7 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.
  * ==========================================================================
  */
+#include <assert.h> /* assert(3) */
 #include <ctype.h> /* isdigit(3) */
 #include <errno.h> /* EILSEQ ENOBUFS ENOMEM ERANGE errno */
 #include <limits.h> /* LINE_MAX ULONG_MAX */
@@ -31,10 +32,10 @@
 #include <regex.h> /* regex_t regcomp(3) regerror(3) regexec(3) regfree(3) */
 #include <stdarg.h> /* va_list va_start va_end */
 #include <stdint.h> /* intmax_t */
-#include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fpurge(3) fputc(3) fputs(3) setvbuf(3) */
+#include <stdio.h> /* _IOFBF BUFSIZ fflush(3) fopen(3) fpurge(3) fputc(3) fputs(3) getdelim(3) setvbuf(3) vsnprintf(3) */
 #include <stdlib.h> /* abort(3) exit(3) free(3) malloc(3) strtoul(3) */
 #include <string.h> /* memcpy(3) memset(3) strdup(3) strerror(3) strlen(3) */
-#include <time.h> /* localtime(3) strftime(3) */
+#include <time.h> /* localtime(3) strftime(3) time(3) */
 
 #include <err.h> /* vwarnx(3) */
 #include <sys/queue.h> /* TAILQ_* */
@@ -74,6 +75,8 @@
 #define MIN(a, b) (((a) < (b))? (a) : (b))
 #undef MAX
 #define MAX(a, b) (((a) > (b))? (a) : (b))
+
+#define countof(a) (sizeof (a) / sizeof *(a))
 
 #if WITH_DEBUG
 #define DEBUG(...) warnx(__VA_ARGS__)
@@ -156,6 +159,10 @@ errno_assert(int error)
 #endif
 }
 
+/*
+ * FIXME: Our simple sbuf structure is being used in ways never intended,
+ * leading to confusing inconsistencies. Should import our fifo.h library.
+ */
 #define SBUF_INTO(_base, _size) { \
 	.base = (unsigned char *)(_base), \
 	.size = (_size), \
@@ -164,6 +171,7 @@ errno_assert(int error)
 struct sbuf {
 	unsigned char *base;
 	size_t size, p;
+	int error;
 };
 
 static struct sbuf *
@@ -172,6 +180,15 @@ sbuf_init(struct sbuf *sbuf, void *base, size_t size)
 	sbuf->base = base;
 	sbuf->size = size;
 	sbuf->p = 0;
+	sbuf->error = 0;
+	return sbuf;
+}
+
+static struct sbuf *
+sbuf_reset(struct sbuf *sbuf)
+{
+	sbuf->p = 0;
+	sbuf->error = 0;
 	return sbuf;
 }
 
@@ -184,7 +201,22 @@ sbuf_clamp(struct sbuf *sbuf, size_t n)
 static int
 sbuf_error(struct sbuf *sbuf)
 {
-	return (sbuf->p <= sbuf->size)? 0 : ENOBUFS;
+	if (sbuf->error) {
+		return sbuf->error;
+	} else if (sbuf->p > sbuf->size) {
+		return (sbuf->error = ENOBUFS);
+	} else {
+		return 0;
+	}
+}
+
+static int
+sbuf_seterror(struct sbuf *sbuf, int error)
+{
+	if (!sbuf->error) {
+		sbuf->error = error;
+	}
+	return sbuf->error;
 }
 
 static void *
@@ -205,13 +237,10 @@ sbuf_putc(struct sbuf *sbuf, unsigned char ch)
 {
 	if (sbuf->p < sbuf->size) {
 		sbuf->base[sbuf->p++] = ch;
-		return 0;
 	} else if (sbuf->p < SIZE_MAX) {
 		sbuf->p++;
-		return ENOBUFS;
-	} else {
-		return ENOBUFS;
 	}
+	return sbuf_error(sbuf);
 }
 
 static int
@@ -238,6 +267,122 @@ sbuf_puts0(struct sbuf *sbuf, const void *src)
 {
 	sbuf_puts(sbuf, src);
 	return sbuf_putc(sbuf, '\0');
+}
+
+static int
+sbuf_putxc(struct sbuf *sbuf, unsigned char ch)
+{
+	sbuf_putc(sbuf, "0123456789abcdef"[0x0f & (ch >> 4)]);
+	return sbuf_putc(sbuf, "0123456789abcdef"[0x0f & (ch >> 0)]);
+}
+
+static int
+sbuf_putx(struct sbuf *sbuf, void *_src, size_t len)
+{
+	const unsigned char *src = _src;
+
+	for (size_t p = 0; p < len; p++) {
+		sbuf_putxc(sbuf, src[p]);
+	}
+
+	return sbuf_error(sbuf);
+}
+
+static int
+sbuf_putf(struct sbuf *sbuf, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(sbuf_getptr(sbuf), sbuf_clamp(sbuf, SIZE_MAX), fmt, ap);
+	if (n >= 0) {
+		sbuf_ffwd(sbuf, n);
+	} else {
+		sbuf_seterror(sbuf, errno_assert(errno));
+	}
+	va_end(ap);
+
+	return sbuf_error(sbuf);
+}
+
+static int
+sbuf_putvc(struct sbuf *sbuf, unsigned char ch, int nextc, const char *special)
+{
+	switch (ch) {
+	case '\0':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, '0');
+		if (nextc == -1 || (nextc >= '0' && nextc <= '7')) {
+			sbuf_putc(sbuf, '0');
+			sbuf_putc(sbuf, '0');
+		}
+		break;
+	case '\a':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'a');
+		break;
+	case '\b':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'b');
+		break;
+	case '\f':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'f');
+		break;
+	case '\n':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'n');
+		break;
+	case '\r':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'r');
+		break;
+	case '\t':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 't');
+		break;
+	case '\v':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, 'v');
+		break;
+	case '\\':
+		sbuf_putc(sbuf, '\\');
+		sbuf_putc(sbuf, '\\');
+		break;
+	default:
+		if (ch >= 0x20 && ch <= 0x7e) {
+			if (special && strchr(special, ch))
+				sbuf_putc(sbuf, ch);
+			sbuf_putc(sbuf, ch);
+		} else {
+			sbuf_putc(sbuf, '\\');
+			sbuf_putc(sbuf, "01234567"[0x7 & (ch >> 5)]);
+			sbuf_putc(sbuf, "01234567"[0x7 & (ch >> 3)]);
+			sbuf_putc(sbuf, "01234567"[0x7 & (ch >> 0)]);
+		}
+		break;
+	}
+
+	return sbuf_error(sbuf);
+}
+
+static int
+sbuf_putv(struct sbuf *sbuf, const void *_src, size_t len, int nextc, const char *special)
+{
+	const unsigned char *src = _src;
+	size_t p = 0;
+
+	if (len > 0) {
+		if (len > 1) {
+			for (size_t pe = len - 1; p < pe; p++)
+				sbuf_putvc(sbuf, src[p], src[p + 1], special);
+		}
+
+		sbuf_putvc(sbuf, src[p], nextc, special);
+	}
+
+	return sbuf_error(sbuf);
 }
 
 static void *
@@ -277,6 +422,11 @@ enum tarsum_errors {
 	TARSUM_EREGEXEC,
 	TARSUM_EBADNSUB,
 	TARSUM_EBADFLAG,
+	TARSUM_EBADSUBI,
+	TARSUM_EBADLINE,
+	TARSUM_ENOMATCH,
+	TARSUM_ENULLCAP,
+	TARSUM_EDUPCSUM,
 	TARSUM_ELAST,
 };
 
@@ -295,9 +445,10 @@ enum tarsum_errors {
 #define TARSUMOPTS_INIT(opts) *tarsumopts_staticinit((opts))
 
 struct tarsumopts {
-	const EVP_MD *mdtype; /* -a option flag */
-	const char *format;   /* -f option flag */
-	const char *timefmt;  /* -t option flag */
+	const EVP_MD *mdtype;  /* -a option flag */
+	const char *checklist; /* -C option flag */
+	const char *format;    /* -f option flag */
+	const char *timefmt;   /* -t option flag */
 };
 
 struct tarsum_subexpr {
@@ -449,6 +600,13 @@ regerror_fill(struct regerror *regerr, int error, const regex_t *regex, const ch
 			return;
 	}
 	regerror(error, regex, regerr->descr, sizeof regerr->descr);
+}
+
+static void
+regerror_clear(struct regerror *regerr)
+{
+	regerr->error = 0;
+	regerr->descr[0] = '\0';
 }
 
 static int
@@ -727,17 +885,321 @@ tarsum_strerror(int error)
 	case TARSUM_EREGEXEC:
 		return "regexec failure";
 	case TARSUM_EBADNSUB:
-		return "miscalculated number of substring matches";
+		return "miscalculated number of subexpression matches";
 	case TARSUM_EBADFLAG:
 		return "unsupported pattern flag";
+	case TARSUM_EBADSUBI:
+		return "specified subexpression index is zero or greater than number of subexpression matches";
+	case TARSUM_EBADLINE:
+		return "empty, truncated, or malformed checksum line";
+	case TARSUM_ENOMATCH:
+		return "checksum regular expression did not match record";
+	case TARSUM_ENULLCAP:
+		return "empty subexpression capture for file name or digest";
+	case TARSUM_EDUPCSUM:
+		return "duplicate checksum with conflicting digest";
 	default:
 		/* FIXME: figure out better way stringify libarchive error codes */
 		return strerror(error);
 	}
 }
 
+struct fileid {
+	unsigned char md[32]; /* SHA256 digest length */
+};
+
+struct checksum {
+	LLRB_ENTRY(checksum) rbe;
+	TAILQ_ENTRY(checksum) tqe;
+	unsigned found;
+	struct fileid id;
+	unsigned char md[EVP_MAX_MD_SIZE];
+	char path[];
+};
+
+struct checklist {
+	regex_t regex;
+	size_t mdlen;
+	char *formatre; /* regular expression matching format specifier */
+	size_t nmatch;
+	regmatch_t *match;
+	regmatch_t *Nsub, *Csub;
+	LLRB_HEAD(checksums, checksum) checksums;
+	TAILQ_HEAD(, checksum) loaded;
+
+	struct {
+		char *line;
+		size_t linelen;
+		struct regerror regerr;
+	} loaderr;
+
+	struct {
+		size_t nerrors; /* # of loading errors */
+		size_t nloaded; /* # of checksums loaded */
+		size_t nfiles;  /* # of files in archive */
+
+		size_t nok;     /* # of matching checksums */
+		size_t nfailed; /* # of checksum failures */
+		size_t nmissed; /* # of checksums in checklist not in archive */
+	} stat;
+};
+
+static int
+csumcmp(const struct checksum *a, const struct checksum *b)
+{
+	return memcmp(a->id.md, b->id.md, sizeof a->id.md);
+}
+
+LLRB_GENERATE_STATIC(checksums, checksum, rbe, csumcmp)
+
+static void
+checklist_clearerr(struct checklist *C)
+{
+	free(C->loaderr.line);
+	C->loaderr.linelen = 0;
+	regerror_clear(&C->loaderr.regerr);
+}
+
+static void
+checklist_destroy(struct checklist **_C)
+{
+	struct checklist *C = *_C;
+	struct checksum *cs;
+
+	if (C == NULL)
+		return;
+	*_C = NULL;
+
+	checklist_clearerr(C);
+
+	while ((cs = TAILQ_FIRST(&C->loaded))) {
+		TAILQ_REMOVE(&C->loaded, cs, tqe);
+		free(cs);
+	}
+
+	free(C->formatre);
+	free(C->match);
+	regfree(&C->regex);
+	free(C);
+}
+
+static int
+checklist_init(struct checklist **_C, const EVP_MD *mdtype, const char *formatre, int cflags, size_t Nsub, size_t Csub, struct regerror *regerr)
+{
+	struct checklist *C = NULL;
+	int error;
+
+	*_C = NULL;
+
+	/*
+	 * NB: Error block at bottom of function uses checklist_destroy,
+	 * which assumes C->regex initialized, so return early
+	 * initialization errors directly. C object becomes consistent only
+	 * after we compile C->regex, a consequence of POSIX seemingly
+	 * refraining from guaranteeing that regex_t can be copied by value.
+	 */
+	if (!(C = calloc(1, sizeof *C))) {
+		return errno_assert(errno);
+	} else if ((error = regcomp(&C->regex, formatre, cflags))) {
+		regerror_fill(regerr, error, &C->regex, NULL);
+		free(C);
+		return TARSUM_EREGCOMP;
+	}
+	/* all other members are safe 0-initialized except .loaded TAILQ */
+	TAILQ_INIT(&C->loaded);
+
+	C->mdlen = EVP_MD_size(mdtype);
+
+	if (!(C->formatre = strdup(formatre)))
+		goto syerr;
+
+	C->nmatch = 1 + C->regex.re_nsub; /* +1 for 0th match */
+	if (!(C->match = calloc(C->nmatch, sizeof *C->match)))
+		goto syerr;
+
+	if (Nsub == 0 || Nsub >= C->nmatch
+	||  Csub == 0 || Csub >= C->nmatch
+	||  Nsub == Csub) {
+		error = TARSUM_EBADSUBI;
+		goto error;
+	}
+	C->Nsub = &C->match[Nsub];
+	C->Csub = &C->match[Csub];
+
+	*_C = C;
+
+	return 0;
+syerr:
+	error = errno_assert(errno);
+error:
+	checklist_destroy(&C);
+
+	return error;
+}
+
+static struct checksum *
+checklist_findid(struct checklist *C, struct fileid *id)
+{
+	struct checksum key = { .id = *id };
+	return LLRB_FIND(checksums, &C->checksums, &key);
+}
+
+static struct checksum *
+checklist_findpath(struct checklist *C, const char *path)
+{
+	struct fileid id;
+	SHA256(id.md, sizeof id.md, path, strlen(path));
+	return checklist_findid(C, &id);
+}
+
+static int fromxdigit(unsigned char, int);
+
+static _Bool
+hex2bin(struct sbuf *dst, const char *src, size_t len)
+{
+	size_t p = 0;
+
+	while (len - p >= 2) {
+		int hi = fromxdigit(src[p++], -1);
+		int lo = fromxdigit(src[p++], -1);
+		if (lo == -1 || hi == -1)
+			return 0;
+		sbuf_putc(dst, ((hi << 4) | (lo << 0)));
+	}
+	return p == len;
+}
+
+static int
+checklist_addcsum(struct checklist *C, const char *path, size_t pathlen, const char *hex, size_t hexlen)
+{
+	struct checksum *cs = NULL;
+	int error;
+
+	size_t size = offsetof(struct checksum, path);
+	if ((error = addsize_overflow(&size, size, pathlen + 1)))
+		goto error;
+	if (!(cs = calloc(1, size)))
+		goto syerr;
+
+	SHA256(cs->id.md, sizeof cs->id.md, path, pathlen);
+
+	struct sbuf md = SBUF_INTO(cs->md, sizeof cs->md);
+	if (!hex2bin(&md, hex, hexlen) || sbuf_error(&md) || md.p != C->mdlen) {
+		error = TARSUM_EBADLINE;
+		goto error;
+	}
+
+	memcpy(cs->path, path, pathlen);
+
+	struct checksum *cs0;
+	if ((cs0 = LLRB_INSERT(checksums, &C->checksums, cs))) {
+		if (0 == memcmp(cs0->md, cs->md, C->mdlen)) {
+			DEBUG("duplicate checksum record for %s", cs->path);
+			free(cs);
+		} else {
+			char hex0[(2 * EVP_MAX_MD_SIZE) + 1] = "";
+			struct sbuf buf = SBUF_INTO(hex0, sizeof hex0 - 1);
+			sbuf_putx(&buf, cs0->md, C->mdlen);
+
+			DEBUG("conflicting checksum records for %s (expected %s, got %.*s)", cs->path, hex0, (int)hexlen, hex);
+			error = TARSUM_EDUPCSUM;
+			goto error;
+		}
+	} else {
+		TAILQ_INSERT_TAIL(&C->loaded, cs, tqe);
+		C->stat.nloaded++;
+	}
+
+	return 0;
+syerr:
+	error = errno_assert(errno);
+error:
+	free(cs);
+	return error;
+}
+
+static int
+checklist_loadline(struct checklist *C, const char *line)
+{
+	const char *path, *md;
+	size_t pathlen, mdlen;
+	regoff_t n;
+	int error;
+
+	if ((error = regexec(&C->regex, line, C->nmatch, C->match, 0))) {
+		if (error == REG_NOMATCH) {
+			return TARSUM_ENOMATCH;
+		} else {
+			regerror_fill(&C->loaderr.regerr, error, &C->regex, NULL);
+			return TARSUM_EREGEXEC;
+		}
+	}
+
+	/*
+	 * FIXME: 0th match should have matched entire line, beginning to
+	 * end, otherwise we may be silently discarding input
+	 */
+
+	n = C->Nsub->rm_eo - C->Nsub->rm_so;
+	if (n <= 0)
+		return TARSUM_ENULLCAP;
+	path = &line[C->Nsub->rm_so];
+	pathlen = n;
+
+	n = C->Csub->rm_eo - C->Csub->rm_so;
+	if (n <= 0)
+		return TARSUM_ENULLCAP;
+	md = &line[C->Csub->rm_so];
+	mdlen = n;
+
+	return checklist_addcsum(C, path, pathlen, md, mdlen);
+}
+
+static int
+checklist_loadfile(struct checklist *C, FILE *fp, int rs)
+{
+	char *line = NULL;
+	size_t linesiz = 0;
+	ssize_t linelen;
+	int error;
+
+	while ((linelen = getdelim(&line, &linesiz, rs, fp)) > 0) {
+		if (line[linelen - 1] != rs) {
+			error = TARSUM_EBADLINE;
+			goto error;
+		}
+
+		/* FIXME: deal with empty lines */
+
+		if ((error = checklist_loadline(C, line)))
+			goto error;
+	}
+
+	if (!feof(fp))
+		goto syerr;
+
+	free(line);
+
+	return 0;
+syerr:
+	error = errno_assert(errno);
+error:
+	if (linelen > 0) {
+		free(C->loaderr.line);
+		C->loaderr.line = line;
+		C->loaderr.linelen = linelen;
+	} else {
+		free(C->loaderr.line);
+		C->loaderr.line = NULL;
+		C->loaderr.linelen = 0;
+		free(line);
+	}
+
+	return error;
+}
+
 struct entry {
-	unsigned char name[32]; /* SHA256 digest length */
+	struct fileid id;
 	unsigned char md[EVP_MAX_MD_SIZE];
 	unsigned mdlen;
 	char path[256];
@@ -749,35 +1211,37 @@ static LLRB_HEAD(entries, entry) entries;
 static int
 entrycmp(const struct entry *a, const struct entry *b)
 {
-	return memcmp(a->name, b->name, sizeof a->name);
+	return memcmp(a->id.md, b->id.md, sizeof a->id.md);
 }
 
 LLRB_GENERATE_STATIC(entries, entry, rbe, entrycmp)
 
-static void
+static struct entry *
 entryadd(const char *path, const void *md, size_t mdlen)
 {
 	struct entry *ent, *oent;
 	if (!(ent = malloc(sizeof *ent)))
 		err(1, "malloc");
 	memset(ent, 0, sizeof *ent);
-	SHA256(ent->name, sizeof ent->name, path, strlen(path));
+	SHA256(ent->id.md, sizeof ent->id.md, path, strlen(path));
 	memcpy(ent->md, md, MIN(mdlen, sizeof ent->md));
 	ent->mdlen = mdlen;
 	tarsum_strlcpy(ent->path, path, sizeof ent->path);
 	if ((oent = LLRB_INSERT(entries, &entries, ent))) {
 		warnx("duplicate (%s) (%s)", path, ent->path);
-		warnx("  %s", md2hex(ent->name, sizeof ent->name));
-		warnx("  %s", md2hex(oent->name, sizeof oent->name));
+		warnx("  %s", md2hex(ent->id.md, sizeof ent->id.md));
+		warnx("  %s", md2hex(oent->id.md, sizeof oent->id.md));
 		free(ent);
+		return oent;
 	}
+	return ent;
 }
 
 static const struct entry *
 entryget(const char *path)
 {
 	struct entry key;
-	SHA256(key.name, sizeof key.name, path, strlen(path));
+	SHA256(key.id.md, sizeof key.id.md, path, strlen(path));
 	return LLRB_FIND(entries, &entries, &key);
 }
 
@@ -1192,6 +1656,419 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 	fflush(fp);
 }
 
+static void
+char2re(struct tarsum *ts, struct sbuf *buf, unsigned char ch)
+{
+	(void)ts;
+
+	/* 9.4.3 ERE Special Characters (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html#tag_09_04_03) */
+	switch (ch) {
+	case '.':
+	case '[':
+	case '\\':
+	case '(':
+	case ')':
+	case '*':
+	case '+':
+	case '?':
+	case '{':
+	case '|':
+	case '^':
+	case '$':
+		sbuf_putc(buf, '\\');
+		/* FALL THROUGH */
+	default:
+		sbuf_putc(buf, ch);
+		break;
+	}
+}
+
+static void
+term2re(struct tarsum *ts, struct sbuf *buf, unsigned char ch, int *lc)
+{
+	char2re(ts, buf, ch);
+	*lc = ch;
+}
+
+static void
+literal2re(struct tarsum *ts, struct sbuf *buf, const char *s)
+{
+	while (*s) {
+		char2re(ts, buf, *s++);
+	}
+}
+
+/* 9.3.5 RE Bracket Expression (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html#tag_09_03_05) */
+static void
+charset2re(struct tarsum *ts, struct sbuf *buf, const char *charset, _Bool invert)
+{
+	int ch;
+	(void)ts;
+
+	sbuf_putc(buf, '[');
+
+	if (invert)
+		sbuf_putc(buf, '^');
+
+	if (strchr(charset, ']'))
+		sbuf_putc(buf, ']');
+	if (strchr(charset, '-'))
+		sbuf_putc(buf, '-');
+
+	while ((ch = *charset++)) {
+		switch (ch) {
+		case '[': /* avoid "[:", "[=", or "[:" sequences (see below) */
+		case ']': /* always goes first (see above) */
+		case '-': /* always goes first (see above) */
+			break;
+		case '\\':
+			/* FALL THROUGH */
+		case '^':
+			sbuf_putc(buf, '\\');
+			/* FALL THROUGH */
+		default:
+			sbuf_putc(buf, ch);
+			break;
+		}
+	}
+
+	if (strchr(charset, '['))
+		sbuf_putc(buf, '[');
+
+	sbuf_putc(buf, ']');
+}
+
+static void
+mode2re(struct tarsum *ts, struct sbuf *buf, const struct fieldspec *fs, size_t *ncap)
+{
+	static const char *const names[] = {
+		"Fifo File",
+		"Character Device",
+		"Directory",
+		"Block Device",
+		"Regular File",
+		"Symbolic Link",
+		"Socket",
+		"Unknown",
+	};
+
+	switch (fs->sub) {
+	case 'H':
+		sbuf_putc(buf, '(');
+		for (unsigned i = 0; i < countof(names); i++) {
+			if (i > 0)
+				sbuf_putc(buf, '|');
+			literal2re(ts, buf, names[i]);
+		}
+		sbuf_putc(buf, ')');
+		++*ncap;
+		break;
+	case '\0':
+		/* FALL THROUGH */
+	case 'L':
+		charset2re(ts, buf, "|/*@=", 0);
+		break;
+	case 'M':
+		charset2re(ts, buf, "pcdbfls", 0);
+		break;
+	default:
+		panic("%s: unsupported format sequence (%%%co)", ts->format, fs->sub);
+	}
+}
+
+static void
+time2re(struct tarsum *ts, struct sbuf *buf, const struct fieldspec *fs)
+{
+	if (fs->fmt == 'S') {
+		size_t min = 0, max = 0;
+		char viz[256];
+		struct tm tm;
+		time_t t = 1577836800; /* 2020-01-01 00:00:00 */
+		size_t n = strftime(viz, sizeof viz, ts->timefmt, localtime_r(&t, &tm));
+		if (n == 0)
+			goto nobufs;
+
+		min = n;
+		max = n;
+		for (unsigned i = 1; i <= 86400; i++) {
+			t++;
+			n = strftime(viz, sizeof viz, ts->timefmt, localtime_r(&t, &tm));
+			if (n == 0)
+				goto nobufs;
+			if (n < min)
+				min = n;
+			if (n > max)
+				max = n;
+		}
+
+		for (unsigned i = 1; i <= 31; i++) {
+			t += (i * 86400);
+			n = strftime(viz, sizeof viz, ts->timefmt, localtime_r(&t, &tm));
+			if (n == 0)
+				goto nobufs;
+			if (n < min)
+				min = n;
+			if (n > max)
+				max = n;
+		}
+
+		for (unsigned i = 1; i <= 14; i++) {
+			t += (i * (86400 * 28));
+			n = strftime(viz, sizeof viz, ts->timefmt, localtime_r(&t, &tm));
+			if (n == 0)
+				goto nobufs;
+			if (n < min)
+				min = n;
+			if (n > max)
+				max = n;
+		}
+
+		if (min != max)
+			warnx("%s: time format not fixed size (%zu to %zu bytes)", ts->timefmt, min, max);
+
+		sbuf_putf(buf, ".{%zu,%zu}", min, max);
+	} else {
+		sbuf_puts(buf, "[0-9]+");
+	}
+
+	return;
+nobufs:
+	panic("%s: unable to translate time format to regular expression (result too large)", ts->timefmt);
+}
+
+static void
+user2re(struct tarsum *ts, struct sbuf *buf, const struct fieldspec *fs)
+{
+	(void)ts;
+
+	if (fs->fmt == 'S') {
+		sbuf_puts(buf, "[._[:alnum:]][-._[:alnum:]]*");
+	} else {
+		sbuf_puts(buf, "[0-9]+");
+	}
+}
+
+static void
+integer2re(const struct tarsum *ts, struct sbuf *buf, const struct fieldspec *fs)
+{
+	(void)ts;
+
+	switch (fs->fmt) {
+	case 'O':
+		sbuf_puts(buf, "-?[0-7]+");
+		break;
+	case 'U':
+		sbuf_puts(buf, "[0-9]+");
+		break;
+	case 'X':
+		sbuf_puts(buf, "[0-9A-Fa-f]+");
+		break;
+	default:
+		sbuf_puts(buf, "-?[0-9]+");
+		break;
+	}
+}
+
+static void
+format2re(struct tarsum *ts, struct sbuf *buf, size_t *_Nsub, size_t *_Csub, int *rs)
+{
+	const unsigned char *fmt = (const unsigned char *)ts->format;
+	unsigned char escaped = 0;
+	struct fieldspec fs = { 0 };
+	size_t ncap = 0, Nsub = 0, Csub = 0;
+	int lc = -1; /* last literal character */
+
+	sbuf_putc(buf, '^');
+
+	while (*fmt) {
+		lc = -1;
+
+		int tok = TOKEN(escaped, *fmt++);
+		switch (tok) {
+		case '\\':
+			escaped = '\\';
+			continue;
+		case '%':
+			escaped = '%';
+			fs = (struct fieldspec){ 0 };
+			continue;
+		}
+
+		switch (tok) {
+		case TOKEN('\\', '0'): /* FALL THROUGH */
+		case TOKEN('\\', '1'): /* FALL THROUGH */
+		case TOKEN('\\', '2'): /* FALL THROUGH */
+		case TOKEN('\\', '3'): /* FALL THROUGH */
+		case TOKEN('\\', '4'): /* FALL THROUGH */
+		case TOKEN('\\', '5'): /* FALL THROUGH */
+		case TOKEN('\\', '6'): /* FALL THROUGH */
+		case TOKEN('\\', '7'):
+			tok = (tok & 0xff) - '0';
+			for (int n = 1; n < 3 && *fmt >= '0' && *fmt <= '7'; n++) {
+				tok <<= 3;
+				tok |= *fmt++ - '0';
+			}
+			term2re(ts, buf, tok, &lc);
+			break;
+		case TOKEN('\\', 'x'):
+			if (EOF != (tok = fromxdigit(*fmt, EOF))) {
+				if (EOF != fromxdigit(*++fmt, EOF)) {
+					tok <<= 4;
+					tok |= fromxdigit(*fmt++, 0);
+				}
+				term2re(ts, buf, tok, &lc);
+			} else {
+				panic("%s: empty escape sequence", ts->format);
+			}
+			break;
+		case TOKEN('\\', '\\'):
+			term2re(ts, buf, '\\', &lc);
+			break;
+		case TOKEN('\\', 'a'):
+			term2re(ts, buf, '\a', &lc);
+			break;
+		case TOKEN('\\', 'b'):
+			term2re(ts, buf, '\b', &lc);
+			break;
+		case TOKEN('\\', 'f'):
+			term2re(ts, buf, '\f', &lc);
+			break;
+		case TOKEN('\\', 'n'):
+			term2re(ts, buf, '\n', &lc);
+			break;
+		case TOKEN('\\', 'r'):
+			term2re(ts, buf, '\r', &lc);
+			break;
+		case TOKEN('\\', 't'):
+			term2re(ts, buf, '\t', &lc);
+			break;
+		case TOKEN('\\', 'v'):
+			term2re(ts, buf, '\v', &lc);
+			break;
+		case TOKEN('%', '%'):
+			term2re(ts, buf, '%', &lc);
+			break;
+		case TOKEN('%', 'A'):
+			literal2re(ts, buf, EVP_MD_name(ts->mdtype));
+			break;
+		case TOKEN('%', 'C'):
+			sbuf_putf(buf, "([0-9A-Fa-f]{%d})", 2 * EVP_MD_size(ts->mdtype));
+			Csub = ++ncap; /* matches are 1-indexed */
+			break;
+		case TOKEN('%', 'D'):
+			fs.fmt = 'D';
+			continue;
+		case TOKEN('%', 'H'):
+			fs.sub = 'H';
+			continue;
+		case TOKEN('%', 'L'):
+			fs.sub = 'L';
+			continue;
+		case TOKEN('%', 'M'):
+			fs.sub = 'M';
+			continue;
+		case TOKEN('%', 'N'):
+			sbuf_puts(buf, "(..*)"); /* capture file names greedily */
+			Nsub = ++ncap; /* matches are 1-indexed */
+			break;
+		case TOKEN('%', 'S'):
+			fs.fmt = 'S';
+			continue;
+		case TOKEN('%', 'O'):
+			fs.fmt = 'O';
+			continue;
+		case TOKEN('%', 'T'):
+			mode2re(ts, buf, &fs, &ncap);
+			break;
+		case TOKEN('%', 'U'):
+			fs.fmt = 'U';
+			continue;
+		case TOKEN('%', 'X'):
+			fs.fmt = 'X';
+			continue;
+		case TOKEN('%', 'a'):
+			time2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'c'):
+			time2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'g'):
+			user2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'm'):
+			time2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'o'):
+			integer2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'u'):
+			user2re(ts, buf, &fs);
+			break;
+		case TOKEN('%', 'z'):
+			integer2re(ts, buf, &fs);
+			break;
+		default:
+			if (isescaped(tok)) {
+				panic("%s: unknown %s sequence (%c%c)", ts->format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
+			}
+			term2re(ts, buf, tok, &lc);
+			break;
+		}
+
+		escaped = 0;
+	}
+
+	if (escaped) {
+		panic("%s: empty %s sequence", ts->format, (escaped == '\\')? "escape" : "format");
+	}
+
+	*_Nsub = Nsub;
+	*_Csub = Csub;
+
+	if (lc == -1)
+		term2re(ts, buf, '\n', &lc);
+
+	*rs = lc;
+
+	/*
+	 * NB: regexec operates on NUL-terminated strings, so even though we
+	 * detect and accept '\0' as a record separator, we have to treat it
+	 * slightly differently
+	 */
+	if (lc == '\0')
+		buf->p--;
+	for (size_t p = 0, pe = MIN(buf->p, buf->size); p < pe; p++) {
+		if (buf->base[p] == '\0')
+			panic("%s: embedded \\0 not allowed within records", ts->format);
+	}
+
+	sbuf_putc(buf, '$');
+}
+
+static void
+checkentry(struct checklist *checklist, const char *path, const void *md, size_t mdlen, struct fileid *id, FILE *fp)
+{
+	struct checksum *cs = (id)? checklist_findid(checklist, id) : checklist_findpath(checklist, path);
+
+	checklist->stat.nfiles++;
+
+	if (cs) {
+		cs->found++;
+
+		assert(checklist->mdlen == mdlen);
+		if (0 == memcmp(cs->md, md, mdlen)) {
+			checklist->stat.nok++;
+			fprintf(fp, "%s: OK\n", path);
+		} else {
+			checklist->stat.nfailed++;
+			fprintf(fp, "%s: FAILED\n", path);
+		}
+		fflush(fp);
+	} else {
+		warnx("%s: checksum not found in checklist", path);
+	}
+}
+
 static const EVP_MD *
 optdigest(const char *opt)
 {
@@ -1244,15 +2121,16 @@ optspush(const char ***opts, size_t *optc, const char *opt)
 	return *opts = p;
 }
 
-#define SHORTOPTS "a:f:s:t:h"
+#define SHORTOPTS "a:C:f:s:t:h"
 static void
 usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 {
 	const char *progname = strrchr(arg0, '/')? strrchr(arg0, '/') + 1 : arg0;
 
 	fprintf(fp,
-		"Usage: %s [-" SHORTOPTS "] [PATH]\n" \
+		"Usage: %s [-" SHORTOPTS "] [TARFILE-PATH]\n" \
 		"  -a DIGEST   digest algorithm (default: \"%s\")\n" \
+		"  -C PATH     checklist for verification of archive contents\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
 		"  -s SUBEXPR  path substitution expression\n" \
 		"  -t TIMEFMT  strftime format specification (default: \"%s\")\n" \
@@ -1283,6 +2161,7 @@ main(int argc, char **argv)
 	struct tarsumopts opts = TARSUMOPTS_INIT(&opts);
 	const char **subexprs = NULL;
 	size_t nsubexpr = 0;
+	struct checklist *checklist = NULL;
 	const char *path = NULL;
 	struct archive_entry *entry;
 	struct tarsum ts = { 0 };
@@ -1298,6 +2177,9 @@ main(int argc, char **argv)
 		switch (optc) {
 		case 'a':
 			opts.mdtype = optdigest(optarg);
+			break;
+		case 'C':
+			opts.checklist = optarg;
 			break;
 		case 'f':
 			opts.format = optarg;
@@ -1322,17 +2204,73 @@ main(int argc, char **argv)
 
 	path = (argc > 0)? *argv : "/dev/stdin";
 
-	error = tarsum_init(&ts, &opts);
-	for (const char **subexpr = subexprs; !error && subexpr && *subexpr; subexpr++) {
-		error = tarsum_addsubexpr(&ts, *subexpr);
-		if (error == TARSUM_EREGCOMP) {
-			warnx("%s", ts.regerr.descr);
-			warnx("%s: bad substitution expression", *subexpr);
+	if ((error = tarsum_init(&ts, &opts)))
+		panic("unable to initialize context: %s", tarsum_strerror(error));
+
+	unsigned nerrs = 0;
+	for (const char **subexpr = subexprs; subexpr && *subexpr; subexpr++) {
+		if ((error = tarsum_addsubexpr(&ts, *subexpr))) {
+			if (error == TARSUM_EREGCOMP) {
+				warnx("%s", ts.regerr.descr);
+				warnx("%s: bad substitution expression", *subexpr);
+			} else {
+				warnx("%s: %s", *subexpr, tarsum_strerror(error));
+			}
+			nerrs++;
 		}
 	}
 	optsfree(&subexprs, &nsubexpr);
-	if (error)
-		panic("unable to initialize context: %s", tarsum_strerror(error));
+	if (nerrs) {
+		tarsum_destroy(&ts);
+		panic("encountered %u errors loading substitution expressions", nerrs);
+	}
+
+	if (opts.checklist) {
+		static char _sbuf[1024], _formatreviz[1024];
+		struct sbuf sbuf = SBUF_INTO(_sbuf, sizeof _sbuf - 1);
+		struct sbuf formatreviz = SBUF_INTO(_formatreviz, sizeof _formatreviz - 1);
+		size_t Nsub = 0, Csub = 0;
+		int rs = -1;
+
+		/*
+		 * translate checksum output format specifier into a
+		 * regular expression
+		 */
+		format2re(&ts, &sbuf, &Nsub, &Csub, &rs);
+		if ((error = sbuf_error(&sbuf)))
+			panic("format2re: %s", tarsum_strerror(error));
+		sbuf_putv(&formatreviz, sbuf.base, MIN(sbuf.p, sbuf.size), '\n', "\"");
+		DEBUG("translated %s to %s", ts.format, formatreviz.base);
+
+		if ((error = checklist_init(&checklist, ts.mdtype, (char *)sbuf.base, REG_EXTENDED, Nsub, Csub, &ts.regerr))) {
+			warnx("using checksum regular expression \"%s\"", formatreviz.base);
+			if (error == TARSUM_EREGCOMP) {
+				warnx("%s", ts.regerr.descr);
+			}
+			panic("unable to initialize checklist: %s", tarsum_strerror(error));
+		}
+
+		FILE *fp = fopen(opts.checklist, "rte");
+		if (!fp)
+			panic("%s: %s", opts.checklist, tarsum_strerror(errno));
+		while ((error = checklist_loadfile(checklist, fp, rs))) {
+			if (checklist->stat.nerrors++ == 0) {
+				warnx("using checksum regular expression \"%s\"", formatreviz.base);
+				warnx("loading checklist from %s", opts.checklist);
+			}
+			if (error == TARSUM_EREGEXEC) {
+				warnx("%s", checklist->loaderr.regerr.descr);
+			}
+			if (checklist->loaderr.line) {
+				sbuf_putv(sbuf_reset(&sbuf), checklist->loaderr.line, checklist->loaderr.linelen, '\n', "\"");
+				sbuf_putc(&sbuf, '\0');
+				warnx("error loading checksum \"%s\": %s", sbuf.base, tarsum_strerror(error));
+			} else {
+				warnx("error loading checksum: %s", tarsum_strerror(error));
+			}
+		}
+		fclose(fp);
+	}
 
 	if (ARCHIVE_OK != (status = archive_read_open_filename(ts.archive, path, 10240)))
 		panic("%s: %s", path, archive_error_string(ts.archive));
@@ -1371,8 +2309,13 @@ main(int argc, char **argv)
 
 			const struct entry *ent = entryget(archive_entry_hardlink(entry));
 			if (ent) {
-				/* XXX: will entry have the fields or should we pass ent? */
-				printentry(&ts, path, ent->md, ent->mdlen, entry, stdout);
+				if (checklist) {
+					/* NB: deliberately passing NULL fileid */
+					checkentry(checklist, path, ent->md, ent->mdlen, NULL, stdout);
+				} else {
+					/* XXX: will entry have the fields or should we pass ent? */
+					printentry(&ts, path, ent->md, ent->mdlen, entry, stdout);
+				}
 			}
 			continue;
 		}
@@ -1400,13 +2343,54 @@ main(int argc, char **argv)
 
 		ts.cursor.etx = archive_filter_bytes(ts.archive, 0);
 
-		printentry(&ts, path, md, mdlen, entry, stdout);
-		entryadd(path, md, mdlen);
+		struct entry *ent = entryadd(path, md, mdlen);
+		if (checklist) {
+			checkentry(checklist, path, md, mdlen, &ent->id, stdout);
+		} else {
+			printentry(&ts, path, md, mdlen, entry, stdout);
+		}
 	}
-	if (archive_errno(ts.archive) != ARCHIVE_OK)
-		panic("%s: %s", path, archive_error_string(ts.archive));
-	if ((error = tarsum_destroy(&ts)))
-		panic("%s: %s", path, tarsum_strerror(error));
 
-	return 0;
+	int exitcode = 0;
+
+	if (checklist) {
+		struct checksum *cs;
+		TAILQ_FOREACH(cs, &checklist->loaded, tqe) {
+			if (!cs->found) {
+				checklist->stat.nmissed++;
+				fprintf(stdout, "%s: MISSED\n", cs->path);
+			}
+		}
+		fflush(stdout);
+
+		if (checklist->stat.nerrors) {
+			warnx("%zu errors loading checklist", checklist->stat.nerrors);
+			exitcode = EXIT_FAILURE;
+		}
+		if (checklist->stat.nloaded == 0) {
+			warnx("empty checklist");
+			exitcode = EXIT_FAILURE;
+		}
+		if (checklist->stat.nfailed || checklist->stat.nmissed) {
+			if (checklist->stat.nfailed)
+				warnx("%zu checksum failures", checklist->stat.nfailed);
+			if (checklist->stat.nmissed)
+				warnx("%zu files missing from archive", checklist->stat.nmissed);
+			exitcode = EXIT_FAILURE;
+		}
+
+		assert(exitcode != 0 || checklist->stat.nloaded == checklist->stat.nok);
+		checklist_destroy(&checklist);
+	}
+
+	if (archive_errno(ts.archive) != ARCHIVE_OK) {
+		warnx("%s: %s", path, archive_error_string(ts.archive));
+		exitcode = EXIT_FAILURE;
+	}
+	if ((error = tarsum_destroy(&ts))) {
+		warnx("%s: %s", path, tarsum_strerror(error));
+		exitcode = EXIT_FAILURE;
+	}
+
+	return exitcode;
 }
