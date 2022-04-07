@@ -2048,7 +2048,7 @@ format2re(struct tarsum *ts, struct sbuf *buf, size_t *_Nsub, size_t *_Csub, int
 			fs.fmt = 'O';
 			continue;
 		case TOKEN('%', 'R'):
-			sbuf_puts(buf, "(OK|FAILED|MISSED)");
+			sbuf_puts(buf, "(OK|FAILED|MISSING)");
 			++ncap;
 			break;
 		case TOKEN('%', 'T'):
@@ -2462,7 +2462,7 @@ main(int argc, char **argv)
 		TAILQ_FOREACH(cs, &checklist->loaded, tqe) {
 			if (!cs->found) {
 				checklist->report.nmissed++;
-				printreport(&opts, cs->path, "MISSED", stdout);
+				printreport(&opts, cs->path, "MISSING", stdout);
 			}
 		}
 		fflush(stdout);
