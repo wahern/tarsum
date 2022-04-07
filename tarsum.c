@@ -430,7 +430,8 @@ enum tarsum_errors {
 	TARSUM_ELAST,
 };
 
-#define TARSUM_F_DEFAULT "%C  %N\\n"
+#define TARSUM_F_DEFAULT "%C  %N%$"
+#define TARSUM_R_DEFAULT "%N: %R%$"
 /*
  * glibc 2.27:  %a %b %e %H:%M:%S %Y
  * macOS 10.14: %a %b %e %X %Y
@@ -448,7 +449,9 @@ struct tarsumopts {
 	const EVP_MD *mdtype;  /* -a option flag */
 	const char *checklist; /* -C option flag */
 	const char *format;    /* -f option flag */
+	const char *report;    /* -R option flag */
 	const char *timefmt;   /* -t option flag */
+	int rs;                /* -0 option flag */
 };
 
 struct tarsum_subexpr {
@@ -463,11 +466,12 @@ struct tarsum_subexpr {
 struct tarsum {
 	const EVP_MD *mdtype;
 	char *format;
+	int rs;
 	char *timefmt;
 	TAILQ_HEAD(, tarsum_subexpr) subexprs;
 	struct archive *archive;
 
-	struct {
+	struct tarsum_cursor {
 		int64_t soh; /* start of heading */
 		int64_t stx; /* start of text */
 		int64_t etx; /* end of text */
@@ -485,7 +489,9 @@ tarsumopts_staticinit(struct tarsumopts *opts)
 	*opts = (struct tarsumopts){
 		.mdtype = EVP_sha256(),
 		.format = TARSUM_F_DEFAULT,
+		.report = TARSUM_R_DEFAULT,
 		.timefmt = TARSUM_T_DEFAULT,
+		.rs = -1,
 	};
 	return opts;
 }
@@ -519,7 +525,7 @@ tarsum_init(struct tarsum *ts, const struct tarsumopts *tsopts)
 {
 	int error;
 
-	*ts = (struct tarsum){ 0 };
+	*ts = (struct tarsum){ .rs = tsopts->rs, };
 	TAILQ_INIT(&ts->subexprs);
 
 	ts->mdtype = tsopts->mdtype;
@@ -941,7 +947,7 @@ struct checklist {
 		size_t nok;     /* # of matching checksums */
 		size_t nfailed; /* # of checksum failures */
 		size_t nmissed; /* # of checksums in checklist not in archive */
-	} stat;
+	} report;
 };
 
 static int
@@ -1107,7 +1113,7 @@ checklist_addcsum(struct checklist *C, const char *path, size_t pathlen, const c
 		}
 	} else {
 		TAILQ_INSERT_TAIL(&C->loaded, cs, tqe);
-		C->stat.nloaded++;
+		C->report.nloaded++;
 	}
 
 	return 0;
@@ -1302,15 +1308,42 @@ fromxdigit(unsigned char ch, int def)
 	return def;
 }
 
+struct fields {
+	int rs;
+	const EVP_MD *A;
+	struct {
+		const void *md;
+		size_t mdlen;
+	} C;
+	const char *N;
+	const char *R;
+	mode_t T;
+	time_t a;
+	time_t c;
+	struct {
+		const char *name;
+		la_int64_t gid;
+	} g;
+	time_t m;
+	struct tarsum_cursor o;
+	struct {
+		const char *name;
+		la_int64_t uid;
+	} u;
+	int64_t z;
+};
+
 struct fieldspec {
 	int fmt;
 	int sub;
 };
 
 static void
-printifield(const struct tarsum *ts, const struct fieldspec *fs, intmax_t v, FILE *fp)
+printifield(const char *format, const struct fieldspec *fs, int field, intmax_t v, FILE *fp)
 {
-	(void)ts;
+	(void)format;
+	(void)field;
+
 	switch (fs->fmt) {
 	case 'O':
 		fprintf(fp, "%jo", v);
@@ -1328,34 +1361,39 @@ printifield(const struct tarsum *ts, const struct fieldspec *fs, intmax_t v, FIL
 }
 
 static void
-printsfield(const struct tarsum *ts, const struct fieldspec *fs, int field, const char *s, FILE *fp)
+printsfield(const char *format, const struct fieldspec *fs, int field, const char *s, FILE *fp)
 {
+	if (s == NULL)
+		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
 	if (fs->fmt && fs->fmt != 'S')
-		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", ts->format, fs->fmt, field);
+		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, field);
 	fputs(s, fp);
 }
 
 static void
-printtfield(const struct tarsum *ts, const struct fieldspec *fs, time_t v, FILE *fp)
+printtfield(const char *format, const char *timefmt, const struct fieldspec *fs, int field, time_t v, FILE *fp)
 {
+	if (v == -1)
+		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
+
 	if (fs->fmt == 'S') {
 		static char buf[MAX(BUFSIZ, LINE_MAX)];
-		size_t n = strftime(buf, sizeof buf, ts->timefmt, localtime(&v));
+		size_t n = strftime(buf, sizeof buf, timefmt, localtime(&v));
 		if (n > 0 && n < sizeof buf) {
 			fputs(buf, fp);
 		} else {
-			panic("%s: unable to format timestamp (%jd)", ts->timefmt, (intmax_t)v);
+			panic("%s: unable to format timestamp (%jd)", timefmt, (intmax_t)v);
 		}
 	} else {
-		printifield(ts, fs, v, fp);
+		printifield(format, fs, field, v, fp);
 	}
 }
 
 static void
-printTfield(const struct tarsum *ts, const struct fieldspec *fs, mode_t mode, FILE *fp)
+printTfield(const char *format, const struct fieldspec *fs, mode_t mode, FILE *fp)
 {
 	if (fs->fmt && fs->fmt != 'S')
-		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", ts->format, fs->fmt, 'T');
+		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, 'T');
 
 	switch (fs->sub) {
 	case 'H':
@@ -1450,22 +1488,41 @@ printTfield(const struct tarsum *ts, const struct fieldspec *fs, mode_t mode, FI
 		break;
 	default:
 		purge(fp);
-		panic("%s: unsupported format sequence (%%%co)", ts->format, fs->sub);
+		panic("%s: unsupported format sequence (%%%co)", format, fs->sub);
 	}
+}
+
+static void
+printugfield(const char *format, const struct fieldspec *_fs, int field, const char *name, la_int64_t id, FILE *fp)
+{
+	struct fieldspec fs = *_fs;
+
+	if (fs.fmt == 'S') {
+		if (name) {
+			printsfield(format, &fs, field, name, fp);
+			return;
+		}
+		fs.fmt = 'D';
+	}
+
+	if (id == -1)
+		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
+
+	printifield(format, &fs, field, id, fp);
 }
 
 #define TOKEN(a, b) (((unsigned char)(a) << 8) | ((unsigned char)(b) << 0))
 #define isescaped(t) (0xff & ((t) >> 8))
 
-/* printentry
+/* print
  *
  * NOTE: escape sequences mirror POSIX shell printf(1), format sequences
  * patterned after BSD stat(1).
  */
 static void
-printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, struct archive_entry *ent, FILE *fp)
+print(const char *format, const char *timefmt, const struct fields *fields, FILE *fp)
 {
-	const unsigned char *fmt = (const unsigned char *)ts->format;
+	const unsigned char *fmt = (const unsigned char *)format;
 	unsigned char escaped = 0;
 	struct fieldspec fs = { 0 };
 
@@ -1507,7 +1564,7 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 				fputc(tok, fp);
 			} else {
 				purge(fp);
-				panic("%s: empty escape sequence", ts->format);
+				panic("%s: empty escape sequence", format);
 			}
 			break;
 		case TOKEN('\\', '\\'):
@@ -1537,11 +1594,14 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 		case TOKEN('%', '%'):
 			fputc('%', fp);
 			break;
+		case TOKEN('%', '$'):
+			fputc((fields->rs >= 0)? fields->rs : '\n', fp);
+			break;
 		case TOKEN('%', 'A'):
-			printsfield(ts, &fs, 'A', EVP_MD_name(ts->mdtype), fp);
+			printsfield(format, &fs, 'A', EVP_MD_name(fields->A), fp);
 			break;
 		case TOKEN('%', 'C'):
-			printsfield(ts, &fs, 'C', md2hex(md, mdlen), fp);
+			printsfield(format, &fs, 'C', (fields->C.md)? md2hex(fields->C.md, fields->C.mdlen) : NULL, fp);
 			break;
 		case TOKEN('%', 'D'):
 			fs.fmt = 'D';
@@ -1556,7 +1616,7 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 			fs.sub = 'M';
 			continue;
 		case TOKEN('%', 'N'):
-			printsfield(ts, &fs, 'N', path, fp);
+			printsfield(format, &fs, 'N', fields->N, fp);
 			break;
 		case TOKEN('%', 'S'):
 			fs.fmt = 'S';
@@ -1564,8 +1624,11 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 		case TOKEN('%', 'O'):
 			fs.fmt = 'O';
 			continue;
+		case TOKEN('%', 'R'):
+			printsfield(format, &fs, 'R', fields->R, fp);
+			break;
 		case TOKEN('%', 'T'):
-			printTfield(ts, &fs, archive_entry_mode(ent), fp);
+			printTfield(format, &fs, fields->T, fp);
 			break;
 		case TOKEN('%', 'U'):
 			fs.fmt = 'U';
@@ -1574,72 +1637,56 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 			fs.fmt = 'X';
 			continue;
 		case TOKEN('%', 'a'):
-			printtfield(ts, &fs, archive_entry_atime(ent), fp);
+			printtfield(format, timefmt, &fs, 'a', fields->a, fp);
 			break;
 		case TOKEN('%', 'c'):
-			printtfield(ts, &fs, archive_entry_ctime(ent), fp);
+			printtfield(format, timefmt, &fs, 'c', fields->c, fp);
 			break;
 		case TOKEN('%', 'g'):
-			if (fs.fmt == 'S') {
-				const char *grp = archive_entry_gname(ent);
-				if (grp) {
-					fputs(grp, fp);
-					break;
-				}
-				/* FALL THROUGH */
-			}
-			printifield(ts, &fs, archive_entry_gid(ent), fp);
+			printugfield(format, &fs, 'g', fields->g.name, fields->g.gid, fp);
 			break;
 		case TOKEN('%', 'm'):
-			printtfield(ts, &fs, archive_entry_mtime(ent), fp);
+			printtfield(format, timefmt, &fs, 'm', fields->m, fp);
 			break;
 		case TOKEN('%', 'o'):
 			switch (fs.sub) {
 			case '\0':
-				printifield(ts, &fs, ts->cursor.stx, fp);
+				printifield(format, &fs, 'o', fields->o.stx, fp);
 				break;
 			case 'H':
-				printifield(ts, &fs, ts->cursor.soh, fp);
+				printifield(format, &fs, 'o', fields->o.soh, fp);
 				break;
 			case 'L':
-				printifield(ts, &fs, ts->cursor.etx, fp);
+				printifield(format, &fs, 'o', fields->o.etx, fp);
 				break;
 			default:
 				purge(fp);
-				panic("%s: unsupported format sequence (%%%co)", ts->format, fs.sub);
+				panic("%s: unsupported format sequence (%%%co)", format, fs.sub);
 			}
 			break;
 		case TOKEN('%', 'u'):
-			if (fs.fmt == 'S') {
-				const char *usr = archive_entry_uname(ent);
-				if (usr) {
-					fputs(usr, fp);
-					break;
-				}
-				/* FALL THROUGH */
-			}
-			printifield(ts, &fs, archive_entry_uid(ent), fp);
+			printugfield(format, &fs, 'u', fields->u.name, fields->u.uid, fp);
 			break;
 		case TOKEN('%', 'z'):
 			switch (fs.sub) {
 			case '\0':
-				printifield(ts, &fs, archive_entry_size(ent), fp);
+				printifield(format, &fs, 'z', fields->z, fp);
 				break;
 			case 'H':
-				printifield(ts, &fs, ts->cursor.stx - ts->cursor.soh, fp);
+				printifield(format, &fs, 'z', fields->o.stx - fields->o.soh, fp);
 				break;
 			case 'L':
-				printifield(ts, &fs, ts->cursor.etx - ts->cursor.soh, fp);
+				printifield(format, &fs, 'z', fields->o.etx - fields->o.soh, fp);
 				break;
 			default:
 				purge(fp);
-				panic("%s: unsupported format sequence (%%%co)", ts->format, fs.sub);
+				panic("%s: unsupported format sequence (%%%co)", format, fs.sub);
 			}
 			break;
 		default:
 			if (isescaped(tok)) {
 				purge(fp);
-				panic("%s: unknown %s sequence (%c%c)", ts->format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
+				panic("%s: unknown %s sequence (%c%c)", format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
 			}
 			fputc(tok, fp);
 			break;
@@ -1650,10 +1697,31 @@ printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, st
 
 	if (escaped) {
 		purge(fp);
-		panic("%s: empty %s sequence", ts->format, (escaped == '\\')? "escape" : "format");
+		panic("%s: empty %s sequence", format, (escaped == '\\')? "escape" : "format");
 	}
 
 	fflush(fp);
+}
+
+static void
+printentry(struct tarsum *ts, const char *path, const void *md, size_t mdlen, struct archive_entry *ent, FILE *fp)
+{
+	const struct fields fields = {
+		.rs = ts->rs,
+		.A = ts->mdtype,
+		.C = { md, mdlen },
+		.N = path,
+		.R = NULL,
+		.T = archive_entry_mode(ent),
+		.a = archive_entry_atime(ent),
+		.c = archive_entry_ctime(ent),
+		.g = { archive_entry_gname(ent), archive_entry_gid(ent) },
+		.m = archive_entry_mtime(ent),
+		.o = ts->cursor,
+		.u = { archive_entry_uname(ent), archive_entry_uid(ent) },
+		.z = archive_entry_size(ent),
+	};
+	print(ts->format, ts->timefmt, &fields, fp);
 }
 
 static void
@@ -1948,6 +2016,9 @@ format2re(struct tarsum *ts, struct sbuf *buf, size_t *_Nsub, size_t *_Csub, int
 		case TOKEN('%', '%'):
 			term2re(ts, buf, '%', &lc);
 			break;
+		case TOKEN('%', '$'):
+			term2re(ts, buf, (ts->rs >= 0)? ts->rs : '\n', &lc);
+			break;
 		case TOKEN('%', 'A'):
 			literal2re(ts, buf, EVP_MD_name(ts->mdtype));
 			break;
@@ -2046,24 +2117,44 @@ format2re(struct tarsum *ts, struct sbuf *buf, size_t *_Nsub, size_t *_Csub, int
 }
 
 static void
-checkentry(struct checklist *checklist, const char *path, const void *md, size_t mdlen, struct fileid *id, FILE *fp)
+printreport(struct tarsumopts *opts, const char *path, const char *status, FILE *fp)
+{
+	const struct fields fields = {
+		.rs = opts->rs,
+		.A = opts->mdtype,
+		.C = { NULL, 0 },
+		.N = path,
+		.R = status,
+		.T = 0,
+		.a = -1,
+		.c = -1,
+		.g = { NULL, -1 },
+		.m = -1,
+		.o = { -1, -1, -1 },
+		.u = { NULL, -1 },
+		.z = -1,
+	};
+	print(opts->report, opts->timefmt, &fields, fp);
+}
+
+static void
+checkentry(struct tarsumopts *opts, struct checklist *checklist, const char *path, const void *md, size_t mdlen, struct fileid *id, FILE *fp)
 {
 	struct checksum *cs = (id)? checklist_findid(checklist, id) : checklist_findpath(checklist, path);
 
-	checklist->stat.nfiles++;
+	checklist->report.nfiles++;
 
 	if (cs) {
 		cs->found++;
 
 		assert(checklist->mdlen == mdlen);
 		if (0 == memcmp(cs->md, md, mdlen)) {
-			checklist->stat.nok++;
-			fprintf(fp, "%s: OK\n", path);
+			checklist->report.nok++;
+			printreport(opts, path, "OK", fp);
 		} else {
-			checklist->stat.nfailed++;
-			fprintf(fp, "%s: FAILED\n", path);
+			checklist->report.nfailed++;
+			printreport(opts, path, "FAILED", fp);
 		}
-		fflush(fp);
 	} else {
 		warnx("%s: checksum not found in checklist", path);
 	}
@@ -2121,7 +2212,7 @@ optspush(const char ***opts, size_t *optc, const char *opt)
 	return *opts = p;
 }
 
-#define SHORTOPTS "a:C:f:s:t:h"
+#define SHORTOPTS "0a:C:f:R:s:t:h"
 static void
 usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 {
@@ -2129,9 +2220,11 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 
 	fprintf(fp,
 		"Usage: %s [-" SHORTOPTS "] [TARFILE-PATH]\n" \
+		"  -0          use NUL (\\0) as default record separator\n" \
 		"  -a DIGEST   digest algorithm (default: \"%s\")\n" \
 		"  -C PATH     checklist for verification of archive contents\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
+		"  -R FORMAT   verification report format (default: \"%s\" )\n" \
 		"  -s SUBEXPR  path substitution expression\n" \
 		"  -t TIMEFMT  strftime format specification (default: \"%s\")\n" \
 		"  -h          print this usage message\n" \
@@ -2141,9 +2234,11 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  \\xNN  hexadecimal escape sequence\n" \
 		"  \\L    C escape sequence (\\\\, \\a, \\b, \\f, \\n, \\r, \\t, \\v)\n" \
 		"  %%%%    percent literal\n" \
+		"  %%$    record separator (e.g. \\n or \\0)\n" \
 		"  %%A    digest name\n" \
 		"  %%C    file digest\n" \
 		"  %%N    file name (full path)\n" \
+		"  %%R    verification status (OK, FAILED, MISSING)\n" \
 		"  %%T    file type (ls -L suffix character; use %%HT for long name, %%MT for single letter)\n" \
 		"  %%g    GID or group name (%%Sg)\n" \
 		"  %%m    last modification time (%%Sm: strftime formatting)\n" \
@@ -2152,7 +2247,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  %%z    file size (%%Hz: header record(s), %%Lz: header and file records)\n" \
 		"\n" \
 		"Report bugs to <william@25thandClement.com>\n",
-	progname, EVP_MD_name(opts->mdtype), opts->format, opts->timefmt);
+	progname, EVP_MD_name(opts->mdtype), opts->format, opts->report, opts->timefmt);
 }
 
 int
@@ -2175,6 +2270,9 @@ main(int argc, char **argv)
 
 	while (-1 != (optc = getopt(argc, argv, SHORTOPTS))) {
 		switch (optc) {
+		case '0':
+			opts.rs = '\0';
+			break;
 		case 'a':
 			opts.mdtype = optdigest(optarg);
 			break;
@@ -2183,6 +2281,9 @@ main(int argc, char **argv)
 			break;
 		case 'f':
 			opts.format = optarg;
+			break;
+		case 'R':
+			opts.report = optarg;
 			break;
 		case 's':
 			optspush(&subexprs, &nsubexpr, optarg);
@@ -2254,7 +2355,7 @@ main(int argc, char **argv)
 		if (!fp)
 			panic("%s: %s", opts.checklist, tarsum_strerror(errno));
 		while ((error = checklist_loadfile(checklist, fp, rs))) {
-			if (checklist->stat.nerrors++ == 0) {
+			if (checklist->report.nerrors++ == 0) {
 				warnx("using checksum regular expression \"%s\"", formatreviz.base);
 				warnx("loading checklist from %s", opts.checklist);
 			}
@@ -2311,7 +2412,7 @@ main(int argc, char **argv)
 			if (ent) {
 				if (checklist) {
 					/* NB: deliberately passing NULL fileid */
-					checkentry(checklist, path, ent->md, ent->mdlen, NULL, stdout);
+					checkentry(&opts, checklist, path, ent->md, ent->mdlen, NULL, stdout);
 				} else {
 					/* XXX: will entry have the fields or should we pass ent? */
 					printentry(&ts, path, ent->md, ent->mdlen, entry, stdout);
@@ -2345,7 +2446,7 @@ main(int argc, char **argv)
 
 		struct entry *ent = entryadd(path, md, mdlen);
 		if (checklist) {
-			checkentry(checklist, path, md, mdlen, &ent->id, stdout);
+			checkentry(&opts, checklist, path, md, mdlen, &ent->id, stdout);
 		} else {
 			printentry(&ts, path, md, mdlen, entry, stdout);
 		}
@@ -2357,29 +2458,29 @@ main(int argc, char **argv)
 		struct checksum *cs;
 		TAILQ_FOREACH(cs, &checklist->loaded, tqe) {
 			if (!cs->found) {
-				checklist->stat.nmissed++;
-				fprintf(stdout, "%s: MISSED\n", cs->path);
+				checklist->report.nmissed++;
+				printreport(&opts, cs->path, "MISSED", stdout);
 			}
 		}
 		fflush(stdout);
 
-		if (checklist->stat.nerrors) {
-			warnx("%zu errors loading checklist", checklist->stat.nerrors);
+		if (checklist->report.nerrors) {
+			warnx("%zu errors loading checklist", checklist->report.nerrors);
 			exitcode = EXIT_FAILURE;
 		}
-		if (checklist->stat.nloaded == 0) {
+		if (checklist->report.nloaded == 0) {
 			warnx("empty checklist");
 			exitcode = EXIT_FAILURE;
 		}
-		if (checklist->stat.nfailed || checklist->stat.nmissed) {
-			if (checklist->stat.nfailed)
-				warnx("%zu checksum failures", checklist->stat.nfailed);
-			if (checklist->stat.nmissed)
-				warnx("%zu files missing from archive", checklist->stat.nmissed);
+		if (checklist->report.nfailed || checklist->report.nmissed) {
+			if (checklist->report.nfailed)
+				warnx("%zu checksum failures", checklist->report.nfailed);
+			if (checklist->report.nmissed)
+				warnx("%zu files missing from archive", checklist->report.nmissed);
 			exitcode = EXIT_FAILURE;
 		}
 
-		assert(exitcode != 0 || checklist->stat.nloaded == checklist->stat.nok);
+		assert(exitcode != 0 || checklist->report.nloaded == checklist->report.nok);
 		checklist_destroy(&checklist);
 	}
 
