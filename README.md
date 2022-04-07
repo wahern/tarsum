@@ -73,6 +73,23 @@ FORMAT (see printf(1) and BSD stat(1))
 Report bugs to <william@25thandClement.com>
 ```
 
+### Option Notes
+
+* -s behaves identically to the [BSD tar(1) -s option](https://man.openbsd.org/tar.1#s).
+  See also [GNU tar(1) --transform](https://www.gnu.org/software/tar/manual/tar.html#transform),
+  which has the same semantics but requires the leading `s` operator implicit
+  in the BSD option.
+
+* -t time format specifications can potentially cause checklist verification
+  headaches if string timestamps (e.g. %Sm) aren't fixed length. To load
+  checklists the format specification is translated to a regular expression.
+  For timestamp components tarsum attempts to determine the minimum and
+  maximum length for the time format without grokking the internal elements,
+  emitting a simple `.{M,N}` subexpression, increasing potential conflict
+  with the wildcard file name subexpression capture. Fortunately, timestamps
+  aren't included in any common checklist formats. And at least for the
+  en_US locale, the default time format is fixed length.
+
 ## HACKING
 
 I originally threw together tarsum.c in a few hours. Some parts are
