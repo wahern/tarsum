@@ -1278,6 +1278,11 @@ purge(FILE *fp)
 #endif
 }
 
+#define purge_and_panic(fp, ...) do { \
+	purge((fp)); \
+	panic(__VA_ARGS__); \
+} while (0)
+
 static int
 parseulong(unsigned long *_lu, const char *opt)
 {
@@ -1364,9 +1369,9 @@ static void
 printsfield(const char *format, const struct fieldspec *fs, int field, const char *s, FILE *fp)
 {
 	if (s == NULL)
-		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
+		purge_and_panic(fp, "%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
 	if (fs->fmt && fs->fmt != 'S')
-		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, field);
+		purge_and_panic(fp, "%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, field);
 	fputs(s, fp);
 }
 
@@ -1374,7 +1379,7 @@ static void
 printtfield(const char *format, const char *timefmt, const struct fieldspec *fs, int field, time_t v, FILE *fp)
 {
 	if (v == -1)
-		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
+		purge_and_panic(fp, "%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
 
 	if (fs->fmt == 'S') {
 		static char buf[MAX(BUFSIZ, LINE_MAX)];
@@ -1382,7 +1387,7 @@ printtfield(const char *format, const char *timefmt, const struct fieldspec *fs,
 		if (n > 0 && n < sizeof buf) {
 			fputs(buf, fp);
 		} else {
-			panic("%s: unable to format timestamp (%jd)", timefmt, (intmax_t)v);
+			purge_and_panic(fp, "%s: unable to format timestamp (%jd)", timefmt, (intmax_t)v);
 		}
 	} else {
 		printifield(format, fs, field, v, fp);
@@ -1393,7 +1398,7 @@ static void
 printTfield(const char *format, const struct fieldspec *fs, mode_t mode, FILE *fp)
 {
 	if (fs->fmt && fs->fmt != 'S')
-		panic("%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, 'T');
+		purge_and_panic(fp, "%s: unsupported format sequence (%c format not supported for %%%c field)", format, fs->fmt, 'T');
 
 	switch (fs->sub) {
 	case 'H':
@@ -1487,8 +1492,7 @@ printTfield(const char *format, const struct fieldspec *fs, mode_t mode, FILE *f
 		}
 		break;
 	default:
-		purge(fp);
-		panic("%s: unsupported format sequence (%%%co)", format, fs->sub);
+		purge_and_panic(fp, "%s: unsupported format sequence (%%%co)", format, fs->sub);
 	}
 }
 
@@ -1506,7 +1510,7 @@ printugfield(const char *format, const struct fieldspec *_fs, int field, const c
 	}
 
 	if (id == -1)
-		panic("%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
+		purge_and_panic(fp, "%s: unsupported format sequence (%%%c field undefined in this context)", format, field);
 
 	printifield(format, &fs, field, id, fp);
 }
@@ -1563,8 +1567,7 @@ print(const char *format, const char *timefmt, const struct fields *fields, FILE
 				}
 				fputc(tok, fp);
 			} else {
-				purge(fp);
-				panic("%s: empty escape sequence", format);
+				purge_and_panic(fp, "%s: empty escape sequence", format);
 			}
 			break;
 		case TOKEN('\\', '\\'):
@@ -1660,8 +1663,7 @@ print(const char *format, const char *timefmt, const struct fields *fields, FILE
 				printifield(format, &fs, 'o', fields->o.etx, fp);
 				break;
 			default:
-				purge(fp);
-				panic("%s: unsupported format sequence (%%%co)", format, fs.sub);
+				purge_and_panic(fp, "%s: unsupported format sequence (%%%co)", format, fs.sub);
 			}
 			break;
 		case TOKEN('%', 'u'):
@@ -1679,14 +1681,12 @@ print(const char *format, const char *timefmt, const struct fields *fields, FILE
 				printifield(format, &fs, 'z', fields->o.etx - fields->o.soh, fp);
 				break;
 			default:
-				purge(fp);
-				panic("%s: unsupported format sequence (%%%co)", format, fs.sub);
+				purge_and_panic(fp, "%s: unsupported format sequence (%%%co)", format, fs.sub);
 			}
 			break;
 		default:
 			if (isescaped(tok)) {
-				purge(fp);
-				panic("%s: unknown %s sequence (%c%c)", format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
+				purge_and_panic(fp, "%s: unknown %s sequence (%c%c)", format, (isescaped(tok) == '\\')? "escape" : "format", (unsigned char)(tok >> 8), (unsigned char)tok);
 			}
 			fputc(tok, fp);
 			break;
@@ -1696,8 +1696,7 @@ print(const char *format, const char *timefmt, const struct fields *fields, FILE
 	}
 
 	if (escaped) {
-		purge(fp);
-		panic("%s: empty %s sequence", format, (escaped == '\\')? "escape" : "format");
+		purge_and_panic(fp, "%s: empty %s sequence", format, (escaped == '\\')? "escape" : "format");
 	}
 
 	fflush(fp);
