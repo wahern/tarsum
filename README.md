@@ -2,7 +2,7 @@
 
 ## DESCRIPTION
 
-`tarsum` generates and validates checksums for files encapsulated with
+`tarsum` generates and validates checksums for files encapsulated within
 common archive file formats. It supports a format specification grammar
 based on the [BSD stat(1)](https://man.openbsd.org/stat.1) utility for
 specifying the checklist and reporting formats. This makes it easy to
