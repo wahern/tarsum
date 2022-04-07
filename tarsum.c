@@ -2047,6 +2047,10 @@ format2re(struct tarsum *ts, struct sbuf *buf, size_t *_Nsub, size_t *_Csub, int
 		case TOKEN('%', 'O'):
 			fs.fmt = 'O';
 			continue;
+		case TOKEN('%', 'R'):
+			sbuf_puts(buf, "(OK|FAILED|MISSED)");
+			++ncap;
+			break;
 		case TOKEN('%', 'T'):
 			mode2re(ts, buf, &fs, &ncap);
 			break;
