@@ -49,7 +49,7 @@ Usage: tarsum [-0a:C:f:R:s:t:h] [TARFILE-PATH]
   -C PATH     checklist for verification of archive contents
   -f FORMAT   format specification (default: "%C  %N%$")
   -R FORMAT   verification report format (default: "%N: %R%$" )
-  -s SUBEXPR  path substitution expression
+  -s SUBEXPR  path substitution expression (see BSD tar(1) -s)
   -t TIMEFMT  strftime format specification (default: "%a %b %e %X %Y")
   -h          print this usage message
 

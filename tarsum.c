@@ -2228,7 +2228,7 @@ usage(const char *arg0, const struct tarsumopts *opts, FILE *fp)
 		"  -C PATH     checklist for verification of archive contents\n" \
 		"  -f FORMAT   format specification (default: \"%s\")\n" \
 		"  -R FORMAT   verification report format (default: \"%s\" )\n" \
-		"  -s SUBEXPR  path substitution expression\n" \
+		"  -s SUBEXPR  path substitution expression (see BSD tar(1) -s)\n" \
 		"  -t TIMEFMT  strftime format specification (default: \"%s\")\n" \
 		"  -h          print this usage message\n" \
 		"\n" \
