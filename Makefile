@@ -1,5 +1,16 @@
 all: tarsum
 
+srcdir = .
+prefix = /usr/local
+bindir = $(prefix)/bin
+
+CP = cp
+INSTALL = $(CP) -p
+INSTALL_PROGRAM = $(INSTALL)
+MKDIR = mkdir
+MKDIR_P = $(MKDIR) -p
+RM = rm
+
 CFLAGS = -g -O2
 CPPFLAGS =
 LDFLAGS =
@@ -31,9 +42,25 @@ ALL_CPPFLAGS = $(LIBARCHIVE_CPPFLAGS) $(OPENSSL_CPPFLAGS) $(WARN_CPPFLAGS) $(CPP
 ALL_LDFLAGS = $(LIBARCHIVE_LDFLAGS) $(OPENSSL_LDFLAGS) $(WARN_LDFLAGS) $(LDFLAGS) $(MYLDFLAGS)
 ALL_LDLIBS = $(MYLDLIBS) $(LDLIBS) $(LIBARCHIVE_LDLIBS) $(OPENSSL_LDLIBS) $(WARN_LDLIBS)
 
-tarsum: tarsum.c
-	$(CC) -o $@ $< $(ALL_CFLAGS) $(ALL_CPPFLAGS) $(ALL_LDFLAGS) $(ALL_LDLIBS)
+tarsum: $(srcdir)/tarsum.c
+	$(CC) -o $@ $(srcdir)/tarsum.c $(ALL_CFLAGS) $(ALL_CPPFLAGS) $(ALL_LDFLAGS) $(ALL_LDLIBS)
+
+check: tarsum
+	: TODO
 
 clean:
 	$(RM) -f tarsum
 	$(RM) -fr tarsum.dSYM
+
+mostlyclean: clean
+
+distclean: mostlyclean
+
+$(DESTDIR)$(bindir)/tarsum: tarsum
+	$(MKDIR_P) $(@D)
+	$(INSTALL_PROGRAM) tarsum $@
+
+install: $(DESTDIR)$(bindir)/tarsum
+
+uninstall:
+	$(RM) -f $(DESTDIR)$(bindir)/tarsum
