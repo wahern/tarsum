@@ -2424,6 +2424,12 @@ main(int argc, char **argv)
 			continue;
 		}
 
+		if(archive_entry_filetype(entry) != AE_IFREG)
+		{
+			/* Only process regular files. */
+			continue;
+		}
+
 		if (!(ctx = EVP_MD_CTX_new()) || !EVP_DigestInit_ex(ctx, ts.mdtype, NULL))
 			errx(1, "%s", openssl_error_string());
 
